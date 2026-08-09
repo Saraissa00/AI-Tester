@@ -319,6 +319,8 @@ def next_button():
             st.rerun()
 
 
+next_button()
+
 if active_tab == TAB_LABELS[0]:
     st.markdown(
         "You give three things, then we build your test question set from them:"
@@ -362,8 +364,9 @@ if active_tab == TAB_LABELS[0]:
     with st.expander("Optional: have AI draft the questions for you"):
         st.markdown(
             "This would read your dataset and About-the-AI document, then draft a full set of test questions "
-            "covering all 9 testing areas automatically. It's not connected yet because it needs a paid Claude "
-            "API key (a small cost — a few cents for a full question set). Say the word and it can be wired up. "
+            "covering all 9 testing areas automatically. It's not connected yet because it needs a paid AI API key "
+            "(from a provider like OpenAI or Anthropic) — a small cost, a few cents for a full question set. "
+            "Say the word and it can be wired up. "
             "For now, write your questions yourself using the template above, or fill in the Source column with "
             "'Dataset' / 'About the AI' / 'General' to mark where each question came from."
         )
@@ -396,8 +399,6 @@ if active_tab == TAB_LABELS[0]:
             st.text_area("About the AI text", st.session_state.about_text, height=350, disabled=True, label_visibility="collapsed")
         else:
             st.info("No document uploaded yet.")
-
-    next_button()
 
 if active_tab == TAB_LABELS[1]:
     if st.session_state.df is None:
@@ -516,8 +517,6 @@ if active_tab == TAB_LABELS[1]:
         )
         st.session_state.df = ensure_columns(edited)
 
-        next_button()
-
 if active_tab == TAB_LABELS[2]:
     if st.session_state.df is None:
         st.info("Upload `test_questions.xlsx` in the Setup tab first.")
@@ -584,8 +583,6 @@ if active_tab == TAB_LABELS[2]:
         else:
             st.info("Click 'Run automatic scoring' to grade the answers you've collected so far.")
 
-    next_button()
-
 if active_tab == TAB_LABELS[3]:
     st.subheader("Detect Bias")
     st.markdown(
@@ -629,8 +626,6 @@ if active_tab == TAB_LABELS[3]:
                 "A low 'About the AI' score means the agent isn't doing what it's described to do. "
                 "A low Dataset score means its answers don't match what it was trained on."
             )
-
-    next_button()
 
 if active_tab == TAB_LABELS[4]:
     st.subheader("Conclusion & Analysis")
