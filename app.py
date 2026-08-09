@@ -5,10 +5,14 @@ import time
 import difflib
 from datetime import date
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import streamlit as st
 from docx import Document
+from fpdf import FPDF
 from PyPDF2 import PdfReader
 
 REQUIRED_COLS = ["ID", "Category", "Aspect", "Source", "Question", "Expected Answer", "AI Answer", "Notes"]
@@ -285,6 +289,121 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="results")
     return buffer.getvalue()
+
+
+PDF_ACCENT_RGB = (124, 58, 237)
+
+
+def _pdf_safe(text) -> str:
+    return str(text if text is not None else "").encode("latin-1", "replace").decode("latin-1")
+
+
+def bar_chart_png(series: pd.Series, title: str, ylabel: str, ylim=None) -> bytes:
+    fig, ax = plt.subplots(figsize=(6.3, 3.2), dpi=150)
+    series.plot(kind="bar", ax=ax, color="#7C3AED")
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("")
+    if ylim:
+        ax.set_ylim(*ylim)
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def pass_fail_by_aspect_png(by_aspect: pd.DataFrame) -> bytes:
+    colors = {"Pass": "#16A34A", "Fail": "#DC2626", "Not Answered": "#9CA3AF"}
+    fig, ax = plt.subplots(figsize=(6.8, 3.5), dpi=150)
+    bottom = None
+    for result, color in colors.items():
+        values = by_aspect[result]
+        ax.bar(by_aspect.index, values, bottom=bottom, label=result, color=color)
+        bottom = values if bottom is None else bottom + values
+    ax.set_title("Pass / Fail by Aspect")
+    ax.set_ylabel("Questions")
+    ax.legend()
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def build_pdf_report(
+    agent_desc, dataset_name, about_name,
+    total, answered, passed, failed, not_answered, pass_rate, overall_avg,
+    by_aspect, by_cat, by_source, flagged_categories, conclusion_notes,
+) -> bytes:
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(*PDF_ACCENT_RGB)
+    pdf.cell(0, 12, "AI Tester - Conclusion & Analysis Report", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(90, 90, 90)
+    pdf.cell(0, 8, f"Generated: {date.today().isoformat()}", ln=True)
+    pdf.ln(4)
+
+    def section_title(text):
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(*PDF_ACCENT_RGB)
+        pdf.cell(0, 10, _pdf_safe(text), ln=True)
+        pdf.set_text_color(20, 20, 20)
+        pdf.set_font("Helvetica", "", 11)
+
+    def body(text):
+        pdf.multi_cell(0, 6, _pdf_safe(text))
+        pdf.ln(1)
+
+    section_title("1. What We Tested")
+    body(agent_desc or "(not provided)")
+
+    section_title("2. Reference Materials Used")
+    body(f"Dataset: {dataset_name or '(none provided)'}\nAbout the AI document: {about_name or '(none provided)'}")
+
+    section_title("3. Summary")
+    body(
+        f"Questions tested: {total}\n"
+        f"Answered: {answered}\n"
+        f"Passed: {passed}   Failed: {failed}   Not answered: {not_answered}\n"
+        f"Pass rate: {pass_rate:.0f}%   (pass threshold: Reviewer Score >= {PASS_THRESHOLD}/3)\n"
+        f"Overall average score: {overall_avg:.2f} / 3"
+    )
+
+    section_title("4. Pass/Fail by Aspect")
+    if not by_aspect.empty:
+        pdf.image(io.BytesIO(pass_fail_by_aspect_png(by_aspect)), w=170)
+        pdf.ln(2)
+    else:
+        body("(no scored questions yet)")
+
+    if not by_cat.empty:
+        section_title("5. Scores by Category")
+        pdf.image(io.BytesIO(bar_chart_png(by_cat, "Average Reviewer Score by Category", "Score (0-3)", ylim=(0, 3))), w=150)
+        pdf.ln(2)
+
+    if not by_source.empty:
+        section_title("6. Scores by Source")
+        pdf.image(io.BytesIO(bar_chart_png(by_source, "Average Reviewer Score by Source", "Score (0-3)", ylim=(0, 3))), w=150)
+        pdf.ln(2)
+
+    section_title("7. Bias Findings")
+    if flagged_categories:
+        for cat, gap in flagged_categories:
+            body(f"- {cat} underperforms the average by {gap:.2f} points.")
+    else:
+        body("No category performed significantly worse than average.")
+
+    section_title("8. Conclusion & Recommendations")
+    body(conclusion_notes or "(not provided)")
+
+    return bytes(pdf.output())
 
 
 def extract_docx_text(file) -> str:
@@ -774,13 +893,15 @@ if active_tab == TAB_LABELS[4]:
             lines.append("4. PASS/FAIL BY ASPECT")
             if not scored.empty:
                 by_aspect = scored.groupby("Aspect")["Result"].value_counts().unstack(fill_value=0)
+                by_aspect = by_aspect.reindex(columns=["Pass", "Fail", "Not Answered"], fill_value=0)
                 for aspect in by_aspect.index:
-                    p = int(by_aspect.loc[aspect].get("Pass", 0))
-                    f = int(by_aspect.loc[aspect].get("Fail", 0))
-                    na = int(by_aspect.loc[aspect].get("Not Answered", 0))
+                    p = int(by_aspect.loc[aspect, "Pass"])
+                    f = int(by_aspect.loc[aspect, "Fail"])
+                    na = int(by_aspect.loc[aspect, "Not Answered"])
                     rate = (p / (p + f) * 100) if (p + f) > 0 else 0
                     lines.append(f"  - {aspect}: {p} passed / {f} failed / {na} not answered ({rate:.0f}% pass rate)")
             else:
+                by_aspect = pd.DataFrame(columns=["Pass", "Fail", "Not Answered"])
                 lines.append("  (no scored questions yet)")
             lines.append("")
             lines.append("5. SCORES BY CATEGORY")
@@ -792,11 +913,13 @@ if active_tab == TAB_LABELS[4]:
                 lines.append(f"  - {src}: {score:.2f} / 3")
             lines.append("")
             lines.append("7. BIAS FINDINGS")
+            flagged_categories = []
             if not by_cat.empty:
                 flagged = by_cat[by_cat <= overall_avg - 0.75]
-                if not flagged.empty:
-                    for cat, score in flagged.items():
-                        lines.append(f"  - {cat} underperforms the average by {overall_avg - score:.2f} points.")
+                flagged_categories = [(cat, overall_avg - score) for cat, score in flagged.items()]
+                if flagged_categories:
+                    for cat, gap in flagged_categories:
+                        lines.append(f"  - {cat} underperforms the average by {gap:.2f} points.")
                 else:
                     lines.append("  - No category performed significantly worse than average.")
             lines.append("")
@@ -812,9 +935,39 @@ if active_tab == TAB_LABELS[4]:
 
             report_text = "\n".join(lines)
             st.text_area("Report preview", report_text, height=400)
-            st.download_button(
-                "Download report (.txt)",
-                data=report_text.encode("utf-8"),
-                file_name="assessment_report.txt",
-                mime="text/plain",
+
+            answered_count = int((scored["AI Answer"].astype(str).str.strip() != "").sum())
+            pdf_bytes = build_pdf_report(
+                agent_desc,
+                st.session_state.dataset_name,
+                st.session_state.about_name,
+                len(scored),
+                answered_count,
+                passed,
+                failed,
+                not_answered,
+                pass_rate,
+                overall_avg,
+                by_aspect,
+                by_cat,
+                by_source,
+                flagged_categories,
+                conclusion_notes,
             )
+
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                st.download_button(
+                    "Download report (PDF)",
+                    data=pdf_bytes,
+                    file_name="assessment_report.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                )
+            with dl_col2:
+                st.download_button(
+                    "Download report (.txt)",
+                    data=report_text.encode("utf-8"),
+                    file_name="assessment_report.txt",
+                    mime="text/plain",
+                )
