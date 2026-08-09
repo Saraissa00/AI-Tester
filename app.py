@@ -306,20 +306,24 @@ TAB_LABELS = [
 if "_goto_tab" in st.session_state:
     st.session_state["active_tab"] = st.session_state.pop("_goto_tab")
 
-active_tab = st.radio(
-    "Navigation", TAB_LABELS, key="active_tab", horizontal=True, label_visibility="collapsed"
-)
 
-
-def next_button():
-    idx = TAB_LABELS.index(active_tab)
+def next_button(current_tab):
+    idx = TAB_LABELS.index(current_tab)
     if idx < len(TAB_LABELS) - 1:
         if st.button("Next →", key=f"next_{idx}"):
             st.session_state["_goto_tab"] = TAB_LABELS[idx + 1]
             st.rerun()
 
 
-next_button()
+col_next, col_nav = st.columns([1, 6])
+
+with col_nav:
+    active_tab = st.radio(
+        "Navigation", TAB_LABELS, key="active_tab", horizontal=True, label_visibility="collapsed"
+    )
+
+with col_next:
+    next_button(active_tab)
 
 if active_tab == TAB_LABELS[0]:
     st.markdown(
