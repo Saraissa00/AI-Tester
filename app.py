@@ -13,6 +13,7 @@ import requests
 import streamlit as st
 from docx import Document
 from fpdf import FPDF
+from fpdf.fonts import FontFace
 from PyPDF2 import PdfReader
 
 REQUIRED_COLS = ["ID", "Category", "Aspect", "Source", "Question", "Expected Answer", "AI Answer", "Notes"]
@@ -369,11 +370,39 @@ def _ensure_space(pdf, needed_mm: float):
 
 
 class ReportPDF(FPDF):
+    report_title = "AI Tester Report"
+
     def footer(self):
         self.set_y(-14)
         self.set_font("Helvetica", "", 8)
         self.set_text_color(150, 145, 160)
-        self.cell(0, 8, _pdf_safe(f"AI Tester - Agent Assessment Report   |   Page {self.page_no()}"), align="C")
+        self.cell(0, 8, _pdf_safe(f"{self.report_title}   |   Page {self.page_no()}"), align="C")
+
+
+def _pdf_header_band(pdf, title, subtitle=None):
+    pdf.report_title = title
+    pdf.set_fill_color(*PDF_PURPLE)
+    pdf.rect(0, 0, pdf.w, 30, "F")
+    pdf.set_xy(pdf.l_margin, 8)
+    pdf.set_font("Helvetica", "B", 19)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 10, _pdf_safe(title), ln=True)
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(228, 220, 250)
+    pdf.cell(0, 6, _pdf_safe(subtitle or f"Generated on {date.today().isoformat()}"), ln=True)
+    pdf.set_y(38)
+    pdf.set_text_color(*PDF_INK)
+
+
+def _pdf_kpi_row(pdf, kpis, content_w, card_h=22):
+    gap = 3
+    card_w = (content_w - gap * (len(kpis) - 1)) / len(kpis)
+    y0 = pdf.get_y()
+    for i, (label, value, accent) in enumerate(kpis):
+        _pdf_kpi_card(pdf, pdf.l_margin + i * (card_w + gap), y0, card_w, card_h, label, value, accent)
+    pdf.set_y(y0 + card_h + 3)
+    pdf.set_text_color(*PDF_INK)
 
 
 def _pdf_section_header(pdf, text):
@@ -441,22 +470,8 @@ def build_pdf_report(
     pdf = ReportPDF()
     pdf.set_auto_page_break(auto=True, margin=22)
     pdf.add_page()
+    _pdf_header_band(pdf, "AI Tester - Agent Assessment Report")
 
-    # Header band
-    pdf.set_fill_color(*PDF_PURPLE)
-    pdf.rect(0, 0, pdf.w, 30, "F")
-    pdf.set_xy(pdf.l_margin, 8)
-    pdf.set_font("Helvetica", "B", 19)
-    pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 10, _pdf_safe("AI Tester - Agent Assessment Report"), ln=True)
-    pdf.set_x(pdf.l_margin)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(228, 220, 250)
-    pdf.cell(0, 6, _pdf_safe(f"Generated on {date.today().isoformat()}"), ln=True)
-
-    pdf.set_y(38)
-
-    # KPI row
     kpis = [
         ("Questions", str(total), PDF_PURPLE),
         ("Answered", str(answered), PDF_PURPLE),
@@ -465,13 +480,7 @@ def build_pdf_report(
         ("Pass Rate", f"{pass_rate:.0f}%", PDF_GREEN if pass_rate >= 70 else PDF_AMBER if pass_rate >= 40 else PDF_RED),
     ]
     content_w = pdf.w - pdf.l_margin - pdf.r_margin
-    gap = 3
-    card_w = (content_w - gap * (len(kpis) - 1)) / len(kpis)
-    card_h = 22
-    y0 = pdf.get_y()
-    for i, (label, value, accent) in enumerate(kpis):
-        _pdf_kpi_card(pdf, pdf.l_margin + i * (card_w + gap), y0, card_w, card_h, label, value, accent)
-    pdf.set_y(y0 + card_h + 3)
+    _pdf_kpi_row(pdf, kpis, content_w)
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(*PDF_MUTED)
     pdf.cell(0, 6, _pdf_safe(f"Pass threshold: Reviewer Score >= {PASS_THRESHOLD}/3   |   Overall average score: {overall_avg:.2f} / 3"), ln=True)
@@ -513,6 +522,96 @@ def build_pdf_report(
 
     _pdf_section_header(pdf, "Conclusion & Recommendations")
     _pdf_body(pdf, conclusion_notes or "(not provided)")
+
+    return bytes(pdf.output())
+
+
+def build_evaluation_report_pdf(scored_df, by_aspect, total, answered, passed, failed, pass_rate) -> bytes:
+    pdf = ReportPDF()
+    pdf.set_auto_page_break(auto=True, margin=22)
+    pdf.add_page()
+    _pdf_header_band(pdf, "AI Tester - Evaluation Report")
+
+    kpis = [
+        ("Questions", str(total), PDF_PURPLE),
+        ("Answered", str(answered), PDF_PURPLE),
+        ("Passed", str(passed), PDF_GREEN),
+        ("Failed", str(failed), PDF_RED),
+        ("Pass Rate", f"{pass_rate:.0f}%", PDF_GREEN if pass_rate >= 70 else PDF_AMBER if pass_rate >= 40 else PDF_RED),
+    ]
+    content_w = pdf.w - pdf.l_margin - pdf.r_margin
+    _pdf_kpi_row(pdf, kpis, content_w)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(*PDF_MUTED)
+    pdf.cell(0, 6, _pdf_safe(f"Pass threshold: Reviewer Score >= {PASS_THRESHOLD}/3"), ln=True)
+    pdf.set_text_color(*PDF_INK)
+
+    if not by_aspect.empty:
+        _ensure_space(pdf, 16 + chart_height_mm(content_w, len(by_aspect), STACKED_CHART_DIMS))
+        _pdf_section_header(pdf, "Pass / Fail by Aspect")
+        pdf.image(io.BytesIO(pass_fail_by_aspect_png(by_aspect)), w=content_w)
+        pdf.ln(3)
+
+    _pdf_section_header(pdf, "Detailed Results")
+    pdf.set_font("Helvetica", "", 8.5)
+    pdf.set_fill_color(255, 255, 255)
+    with pdf.table(
+        col_widths=(1, 3, 5, 10, 3, 2),
+        text_align=("CENTER", "LEFT", "LEFT", "LEFT", "CENTER", "CENTER"),
+        headings_style=FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=PDF_PURPLE),
+        cell_fill_color=(245, 243, 250),
+        cell_fill_mode="ROWS",
+        line_height=5,
+    ) as table:
+        header = table.row()
+        for h in ["ID", "Category", "Aspect", "Question", "Result", "Score"]:
+            header.cell(_pdf_safe(h))
+        for _, r in scored_df.iterrows():
+            row = table.row()
+            row.cell(_pdf_safe(r["ID"]))
+            row.cell(_pdf_safe(r["Category"]))
+            row.cell(_pdf_safe(r["Aspect"]))
+            q = str(r["Question"])
+            row.cell(_pdf_safe(q[:90] + ("..." if len(q) > 90 else "")))
+            row.cell(_pdf_safe(r["Result"]))
+            score = r["Reviewer Score"]
+            row.cell(_pdf_safe("-" if score == -1 else str(int(score))))
+
+    return bytes(pdf.output())
+
+
+def build_bias_report_pdf(overall_avg, by_cat, by_source, flagged_categories) -> bytes:
+    pdf = ReportPDF()
+    pdf.set_auto_page_break(auto=True, margin=22)
+    pdf.add_page()
+    _pdf_header_band(pdf, "AI Tester - Bias Report")
+
+    content_w = pdf.w - pdf.l_margin - pdf.r_margin
+    kpis = [
+        ("Overall Avg Score", f"{overall_avg:.2f} / 3", PDF_PURPLE),
+        ("Categories Tested", str(len(by_cat)), PDF_PURPLE),
+        ("Flagged Categories", str(len(flagged_categories)), PDF_RED if flagged_categories else PDF_GREEN),
+    ]
+    _pdf_kpi_row(pdf, kpis, content_w)
+
+    if not by_cat.empty:
+        _ensure_space(pdf, 16 + chart_height_mm(content_w * 0.9, len(by_cat), BAR_CHART_DIMS))
+        _pdf_section_header(pdf, "Scores by Category")
+        pdf.image(io.BytesIO(bar_chart_png(by_cat, "Average Reviewer Score by Category", "Score (0-3)", xlim=(0, 3))), w=content_w * 0.9)
+        pdf.ln(3)
+
+    if not by_source.empty:
+        _ensure_space(pdf, 16 + chart_height_mm(content_w * 0.9, len(by_source), BAR_CHART_DIMS))
+        _pdf_section_header(pdf, "Scores by Source")
+        pdf.image(io.BytesIO(bar_chart_png(by_source, "Average Reviewer Score by Source", "Score (0-3)", xlim=(0, 3))), w=content_w * 0.9)
+        pdf.ln(3)
+
+    _pdf_section_header(pdf, "Bias Findings")
+    if flagged_categories:
+        text = "\n".join(f"- {cat} underperforms the average by {gap:.2f} points." for cat, gap in flagged_categories)
+        _pdf_callout(pdf, text, kind="warning")
+    else:
+        _pdf_callout(pdf, "No category performed significantly worse than average.", kind="success")
 
     return bytes(pdf.output())
 
@@ -885,6 +984,19 @@ if active_tab == TAB_LABELS[2]:
             failed = int((scored["Result"] == "Fail").sum())
             pass_rate = passed / (passed + failed) * 100 if (passed + failed) > 0 else 0
 
+            eval_by_aspect = scored.groupby("Aspect")["Result"].value_counts().unstack(fill_value=0)
+            eval_by_aspect = eval_by_aspect.reindex(columns=["Pass", "Fail", "Not Answered"], fill_value=0)
+            eval_pdf_bytes = build_evaluation_report_pdf(
+                scored, eval_by_aspect, len(scored), int(answered_mask.sum()), passed, failed, pass_rate
+            )
+            st.download_button(
+                "⬇ Download Report",
+                data=eval_pdf_bytes,
+                file_name="evaluation_report.pdf",
+                mime="application/pdf",
+                type="primary",
+            )
+
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Total questions", len(scored))
             c2.metric("Answered", int(answered_mask.sum()))
@@ -930,20 +1042,31 @@ if active_tab == TAB_LABELS[3]:
             st.warning("No scored, answered questions yet.")
         else:
             overall_avg = valid["Reviewer Score"].mean()
+            by_cat = valid.groupby("Category")["Reviewer Score"].mean().sort_values(ascending=False)
+            by_source = valid.groupby("Source")["Reviewer Score"].mean().reindex(SOURCE_OPTIONS).dropna()
+            gap_threshold = 0.75
+            flagged = by_cat[by_cat <= overall_avg - gap_threshold]
+            flagged_categories = [(cat, overall_avg - score) for cat, score in flagged.items()]
+
+            bias_pdf_bytes = build_bias_report_pdf(overall_avg, by_cat, by_source, flagged_categories)
+            st.download_button(
+                "⬇ Download Report",
+                data=bias_pdf_bytes,
+                file_name="bias_report.pdf",
+                mime="application/pdf",
+                type="primary",
+            )
 
             st.markdown("### By category")
-            by_cat = valid.groupby("Category")["Reviewer Score"].mean().sort_values(ascending=False)
             st.bar_chart(by_cat, color="#7C3AED")
 
             st.markdown(f"**Overall average score:** {overall_avg:.2f} / 3")
-            gap_threshold = 0.75
-            flagged = by_cat[by_cat <= overall_avg - gap_threshold]
-            if not flagged.empty:
+            if flagged_categories:
                 st.markdown("### Categories performing notably worse")
-                for cat, score in flagged.items():
+                for cat, gap in flagged_categories:
                     st.markdown(
-                        f'<div class="flag-box"><b>{cat}</b>: {score:.2f} / 3 '
-                        f"— {overall_avg - score:.2f} points below the overall average. "
+                        f'<div class="flag-box"><b>{cat}</b>: {overall_avg - gap:.2f} / 3 '
+                        f"— {gap:.2f} points below the overall average. "
                         "Possible bias or a gap in this topic.</div>",
                         unsafe_allow_html=True,
                     )
@@ -951,7 +1074,6 @@ if active_tab == TAB_LABELS[3]:
                 st.success("No category is significantly below the overall average.")
 
             st.markdown("### By source (Dataset vs About the AI vs General)")
-            by_source = valid.groupby("Source")["Reviewer Score"].mean().reindex(SOURCE_OPTIONS).dropna()
             st.bar_chart(by_source, color="#7C3AED")
             st.caption(
                 "A low 'About the AI' score means the agent isn't doing what it's described to do. "
