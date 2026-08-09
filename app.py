@@ -80,14 +80,6 @@ st.markdown(
         align-items: center;
     }
 
-    .brand-accent {
-        display: inline-block;
-        width: 12px;
-        height: 12px;
-        border-radius: 3px;
-        background: #7C3AED;
-        margin-right: 8px;
-    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -289,10 +281,7 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
-st.markdown(
-    '<span class="brand-accent"></span><span style="font-size:2rem; font-weight:700; color:#211B2E;">AI Tester</span>',
-    unsafe_allow_html=True,
-)
+st.title("AI Tester")
 st.caption("A one-time evaluation of how well an existing AI agent answers questions.")
 
 TAB_LABELS = [
