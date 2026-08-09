@@ -332,7 +332,7 @@ if active_tab == TAB_LABELS[0]:
             st.session_state["_dataset_file_id"] = dataset_file.file_id
 
     with col2:
-        st.markdown('<div class="setup-card"><h4>2. About the AI</h4><p>A document explaining what this AI is and what it\'s supposed to do.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="setup-card"><h4>2. About The AI</h4><p>A document explaining what this AI is and what it\'s supposed to do.</p></div>', unsafe_allow_html=True)
         about_file = st.file_uploader("Upload About the AI document", type=["docx", "pdf", "txt"], key="about_upl", label_visibility="collapsed")
         if about_file is not None and about_file.file_id != st.session_state.get("_about_file_id"):
             st.session_state.about_text = load_about_doc(about_file)
