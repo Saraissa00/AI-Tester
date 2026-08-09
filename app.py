@@ -23,9 +23,10 @@ st.markdown(
 
     h1, h2, h3 { color: #211B2E; font-weight: 650; letter-spacing: -0.01em; }
 
-    .stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid #E5E1EE; }
-    .stTabs [data-baseweb="tab"] { color: #6B6478; font-weight: 500; padding: 10px 18px; }
-    .stTabs [aria-selected="true"] { color: #7C3AED !important; }
+    div[role="radiogroup"] { gap: 4px; border-bottom: 1px solid #E5E1EE; padding-bottom: 10px; }
+    div[role="radiogroup"] label { color: #6B6478; font-weight: 500; padding: 6px 4px; }
+    div[role="radiogroup"] label:has(input:checked) { color: #7C3AED !important; font-weight: 650; }
+    div[role="radiogroup"] label > div:first-child { display: none; }
 
     .stMetric {
         background-color: #F5F3FA;
@@ -294,11 +295,31 @@ st.markdown(
 )
 st.caption("A one-time evaluation of how well an existing AI agent answers questions.")
 
-tab0, tab1, tab2, tab3, tab4 = st.tabs(
-    ["1. Setup", "2. Send Questions to the AI", "3. Evaluate the Answers", "4. Detect Bias", "5. Conclusion & Analysis"]
+TAB_LABELS = [
+    "1. Setup",
+    "2. Send Questions to the AI",
+    "3. Evaluate the Answers",
+    "4. Detect Bias",
+    "5. Conclusion & Analysis",
+]
+
+if "_goto_tab" in st.session_state:
+    st.session_state["active_tab"] = st.session_state.pop("_goto_tab")
+
+active_tab = st.radio(
+    "Navigation", TAB_LABELS, key="active_tab", horizontal=True, label_visibility="collapsed"
 )
 
-with tab0:
+
+def next_button():
+    idx = TAB_LABELS.index(active_tab)
+    if idx < len(TAB_LABELS) - 1:
+        if st.button("Next →", key=f"next_{idx}"):
+            st.session_state["_goto_tab"] = TAB_LABELS[idx + 1]
+            st.rerun()
+
+
+if active_tab == TAB_LABELS[0]:
     st.markdown(
         "You give three things, then we build your test question set from them:"
     )
@@ -376,7 +397,9 @@ with tab0:
         else:
             st.info("No document uploaded yet.")
 
-with tab1:
+    next_button()
+
+if active_tab == TAB_LABELS[1]:
     if st.session_state.df is None:
         st.info("Upload `test_questions.xlsx` in the Setup tab first.")
     else:
@@ -493,7 +516,9 @@ with tab1:
         )
         st.session_state.df = ensure_columns(edited)
 
-with tab2:
+        next_button()
+
+if active_tab == TAB_LABELS[2]:
     if st.session_state.df is None:
         st.info("Upload `test_questions.xlsx` in the Setup tab first.")
     else:
@@ -559,7 +584,9 @@ with tab2:
         else:
             st.info("Click 'Run automatic scoring' to grade the answers you've collected so far.")
 
-with tab3:
+    next_button()
+
+if active_tab == TAB_LABELS[3]:
     st.subheader("Detect Bias")
     st.markdown(
         "Bias means the AI performs noticeably worse for certain topics, question types, or phrasings than others. "
@@ -603,7 +630,9 @@ with tab3:
                 "A low Dataset score means its answers don't match what it was trained on."
             )
 
-with tab4:
+    next_button()
+
+if active_tab == TAB_LABELS[4]:
     st.subheader("Conclusion & Analysis")
     st.markdown("This is the deliverable — everything else was in service of this.")
     if "scored_df" not in st.session_state:
