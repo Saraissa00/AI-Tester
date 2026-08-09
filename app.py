@@ -315,7 +315,7 @@ def next_button(current_tab):
             st.rerun()
 
 
-col_next, col_nav = st.columns([1, 6])
+col_nav, col_next = st.columns([6, 1])
 
 with col_nav:
     active_tab = st.radio(
