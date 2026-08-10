@@ -851,12 +851,14 @@ def build_headers(auth_type: str, auth_value: str, header_name: str) -> dict:
     return headers
 
 
-def call_agent_api(url: str, headers: dict, payload: dict, auth_type: str, auth_value: str):
+def call_agent_api(url: str, headers: dict, payload: dict, auth_type: str, auth_value: str, plain_text: bool = False):
     params = {}
     if auth_type == "API key as query param" and auth_value:
         params["api_key"] = auth_value
-    response = requests.post(url, headers=headers, json=payload, params=params, timeout=30)
+    response = requests.post(url, headers=headers, json=payload, params=params, timeout=60)
     response.raise_for_status()
+    if plain_text:
+        return response.text
     return response.json()
 
 
@@ -1057,10 +1059,16 @@ if active_tab == TAB_LABELS[1]:
                     key="api_body_template",
                     height=80,
                 )
+                plain_text_response = st.checkbox(
+                    "Response is plain text (not JSON) — e.g. a streamed chat reply",
+                    value=False,
+                    key="api_plain_text",
+                )
                 response_path = st.text_input(
                     "Where's the answer in the response? (dot path, e.g. answer or data.reply)",
                     value="answer",
                     key="api_response_path",
+                    disabled=plain_text_response,
                 )
 
                 test_col, send_col = st.columns(2)
@@ -1076,10 +1084,13 @@ if active_tab == TAB_LABELS[1]:
                                 with st.expander("Request sent (debug)"):
                                     st.write("Headers:", {k: v for k, v in headers.items()})
                                     st.write("Payload:", payload)
-                                raw = call_agent_api(api_url, headers, payload, auth_type, auth_value)
-                                answer = resolve_path(raw, response_path)
+                                raw = call_agent_api(api_url, headers, payload, auth_type, auth_value, plain_text_response)
+                                answer = raw.strip() if plain_text_response else resolve_path(raw, response_path)
                                 st.success("Connected. Here's what came back:")
-                                st.json(raw)
+                                if plain_text_response:
+                                    st.text(raw)
+                                else:
+                                    st.json(raw)
                                 if answer:
                                     st.markdown(f"**Extracted answer:** {answer}")
                                 else:
@@ -1111,8 +1122,8 @@ if active_tab == TAB_LABELS[1]:
                                 status.text(f"Sending question {i + 1} of {total}...")
                                 try:
                                     payload = build_payload(body_template, str(row["Question"]))
-                                    raw = call_agent_api(api_url, headers, payload, auth_type, auth_value)
-                                    answer = resolve_path(raw, response_path)
+                                    raw = call_agent_api(api_url, headers, payload, auth_type, auth_value, plain_text_response)
+                                    answer = raw.strip() if plain_text_response else resolve_path(raw, response_path)
                                     if answer:
                                         work.at[idx, "AI Answer"] = str(answer)
                                     else:
