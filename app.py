@@ -876,8 +876,8 @@ TAB_LABELS = [
     "2. Send Questions to the AI",
     "3. Evaluate the Answers",
     "4. Detect Bias",
-    "5. Conclusion & Analysis",
-    "6. Dashboard",
+    "5. Dashboard",
+    "6. Conclusion & Analysis",
 ]
 
 if "_goto_tab" in st.session_state:
@@ -1245,7 +1245,7 @@ if active_tab == TAB_LABELS[3]:
                 "A low Dataset score means its answers don't match what it was trained on."
             )
 
-if active_tab == TAB_LABELS[4]:
+if active_tab == TAB_LABELS[5]:
     st.subheader("Conclusion & Analysis")
     st.markdown("This is the deliverable — everything else was in service of this.")
     if "scored_df" not in st.session_state:
@@ -1398,7 +1398,7 @@ if active_tab == TAB_LABELS[4]:
                 mime="text/plain",
             )
 
-if active_tab == TAB_LABELS[5]:
+if active_tab == TAB_LABELS[4]:
     st.subheader("Dashboard")
     st.markdown("Slice and drill into your current results, and track pass rate across saved runs over time.")
 
