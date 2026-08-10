@@ -3,7 +3,9 @@ import re
 import json
 import time
 import difflib
-from datetime import date
+import sqlite3
+from pathlib import Path
+from datetime import date, datetime
 
 import matplotlib
 matplotlib.use("Agg")
@@ -30,6 +32,116 @@ ASPECT_OPTIONS = [
     "General",
 ]
 PASS_THRESHOLD = 2  # Reviewer Score >= this counts as a Pass
+
+DB_PATH = Path(__file__).parent / "ai_tester_history.db"
+
+
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_db():
+    conn = get_conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            agent_desc TEXT,
+            dataset_name TEXT,
+            about_name TEXT,
+            total INTEGER,
+            answered INTEGER,
+            passed INTEGER,
+            failed INTEGER,
+            not_answered INTEGER,
+            pass_rate REAL,
+            overall_avg REAL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS run_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            question_id TEXT,
+            category TEXT,
+            aspect TEXT,
+            source TEXT,
+            question TEXT,
+            expected_answer TEXT,
+            ai_answer TEXT,
+            similarity REAL,
+            auto_score INTEGER,
+            reviewer_score INTEGER,
+            result TEXT,
+            FOREIGN KEY (run_id) REFERENCES runs (id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_run(agent_desc, dataset_name, about_name, total, answered, passed, failed, not_answered, pass_rate, overall_avg, scored_df) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO runs (created_at, agent_desc, dataset_name, about_name, total, answered, passed, failed, not_answered, pass_rate, overall_avg) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            datetime.now().isoformat(timespec="seconds"),
+            agent_desc,
+            dataset_name,
+            about_name,
+            total,
+            answered,
+            passed,
+            failed,
+            not_answered,
+            pass_rate,
+            overall_avg,
+        ),
+    )
+    run_id = cur.lastrowid
+    for _, r in scored_df.iterrows():
+        cur.execute(
+            "INSERT INTO run_questions (run_id, question_id, category, aspect, source, question, expected_answer, ai_answer, similarity, auto_score, reviewer_score, result) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                str(r["ID"]),
+                r["Category"],
+                r["Aspect"],
+                r["Source"],
+                r["Question"],
+                r["Expected Answer"],
+                r["AI Answer"],
+                r.get("Similarity %"),
+                r.get("Auto Score (0-3)"),
+                r["Reviewer Score"],
+                r["Result"],
+            ),
+        )
+    conn.commit()
+    conn.close()
+    return run_id
+
+
+def fetch_runs() -> pd.DataFrame:
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT id AS 'Run #', created_at AS 'Saved At', total AS 'Questions', answered AS 'Answered', "
+        "passed AS 'Passed', failed AS 'Failed', pass_rate AS 'Pass Rate %', overall_avg AS 'Avg Score' "
+        "FROM runs ORDER BY created_at DESC",
+        conn,
+    )
+    conn.close()
+    return df
+
+
+init_db()
 
 st.set_page_config(page_title="AI Tester", page_icon="\U0001F9EA", layout="wide")
 
@@ -713,6 +825,7 @@ TAB_LABELS = [
     "3. Evaluate the Answers",
     "4. Detect Bias",
     "5. Conclusion & Analysis",
+    "6. Dashboard",
 ]
 
 if "_goto_tab" in st.session_state:
@@ -1131,13 +1244,31 @@ if active_tab == TAB_LABELS[4]:
             conclusion_notes,
         )
 
-        st.download_button(
-            "⬇ Download Report",
-            data=pdf_bytes,
-            file_name="assessment_report.pdf",
-            mime="application/pdf",
-            type="primary",
-        )
+        dl_col, save_col = st.columns(2)
+        with dl_col:
+            st.download_button(
+                "⬇ Download Report",
+                data=pdf_bytes,
+                file_name="assessment_report.pdf",
+                mime="application/pdf",
+                type="primary",
+            )
+        with save_col:
+            if st.button("💾 Save Run to History"):
+                run_id = save_run(
+                    agent_desc,
+                    st.session_state.dataset_name,
+                    st.session_state.about_name,
+                    len(scored),
+                    answered_count,
+                    passed,
+                    failed,
+                    not_answered,
+                    pass_rate,
+                    overall_avg,
+                    scored,
+                )
+                st.success(f"Saved as run #{run_id}. View trends in the Dashboard tab.")
         st.caption("Updates automatically as you edit the fields below — just click Download again when ready.")
 
         st.markdown("##### What is this AI agent supposed to do?")
@@ -1200,3 +1331,73 @@ if active_tab == TAB_LABELS[4]:
                 file_name="assessment_report.txt",
                 mime="text/plain",
             )
+
+if active_tab == TAB_LABELS[5]:
+    st.subheader("Dashboard")
+    st.markdown("Slice and drill into your current results, and track pass rate across saved runs over time.")
+
+    if "scored_df" not in st.session_state:
+        st.info("Run scoring in tab 3 (Evaluate the Answers) first.")
+    else:
+        scored = st.session_state.scored_df.copy()
+        scored["Result"] = scored["Reviewer Score"].apply(result_from_score)
+
+        st.markdown("### Slice the current run")
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            aspect_filter = st.multiselect("Aspect", sorted(scored["Aspect"].unique()))
+        with f2:
+            category_filter = st.multiselect("Category", sorted(scored["Category"].unique()))
+        with f3:
+            source_filter = st.multiselect("Source", sorted(scored["Source"].unique()))
+        with f4:
+            result_filter = st.multiselect("Result", ["Pass", "Fail", "Not Answered"])
+
+        filtered = scored.copy()
+        if aspect_filter:
+            filtered = filtered[filtered["Aspect"].isin(aspect_filter)]
+        if category_filter:
+            filtered = filtered[filtered["Category"].isin(category_filter)]
+        if source_filter:
+            filtered = filtered[filtered["Source"].isin(source_filter)]
+        if result_filter:
+            filtered = filtered[filtered["Result"].isin(result_filter)]
+
+        f_passed = int((filtered["Result"] == "Pass").sum())
+        f_failed = int((filtered["Result"] == "Fail").sum())
+        f_rate = f_passed / (f_passed + f_failed) * 100 if (f_passed + f_failed) > 0 else 0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Matching questions", len(filtered))
+        m2.metric("Passed", f_passed)
+        m3.metric("Failed", f_failed)
+        m4.metric("Pass rate", f"{f_rate:.0f}%")
+
+        st.markdown("### Drill-down: matching questions")
+        st.dataframe(
+            filtered[["ID", "Category", "Aspect", "Source", "Question", "AI Answer", "Result", "Reviewer Score"]],
+            use_container_width=True,
+        )
+
+        if not filtered.empty:
+            dd1, dd2 = st.columns(2)
+            with dd1:
+                st.markdown("**By Aspect**")
+                st.bar_chart(filtered["Aspect"].value_counts(), color="#7C3AED")
+            with dd2:
+                st.markdown("**By Category**")
+                st.bar_chart(filtered["Category"].value_counts(), color="#7C3AED")
+
+    st.markdown("---")
+    st.markdown("### Run history")
+    runs_df = fetch_runs()
+    if runs_df.empty:
+        st.info("No runs saved yet. Use 'Save Run to History' in the Conclusion tab to start tracking trends here.")
+    else:
+        st.dataframe(runs_df, use_container_width=True)
+        if len(runs_df) > 1:
+            trend = runs_df.sort_values("Saved At")[["Saved At", "Pass Rate %"]].set_index("Saved At")
+            st.markdown("**Pass rate over time**")
+            st.line_chart(trend, color="#7C3AED")
+        else:
+            st.caption("Save at least 2 runs to see a trend line here.")
