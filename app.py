@@ -20,6 +20,7 @@ from PyPDF2 import PdfReader
 
 REQUIRED_COLS = ["ID", "Category", "Aspect", "Source", "Question", "Expected Answer", "AI Answer", "Notes"]
 SOURCE_OPTIONS = ["Dataset", "About the AI", "General"]
+CATEGORY_OPTIONS = ["Normal", "Edge Case", "Tricky", "Bias Probe", "Uncategorized"]
 ASPECT_OPTIONS = [
     "Functional Correctness",
     "Model Accuracy & Performance",
@@ -1125,6 +1126,7 @@ if active_tab == TAB_LABELS[1]:
             use_container_width=True,
             key="editor_qa",
             column_config={
+                "Category": st.column_config.SelectboxColumn(options=CATEGORY_OPTIONS),
                 "Source": st.column_config.SelectboxColumn(options=SOURCE_OPTIONS),
                 "Aspect": st.column_config.SelectboxColumn(options=ASPECT_OPTIONS),
             },
