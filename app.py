@@ -1000,110 +1000,124 @@ if active_tab == TAB_LABELS[1]:
             "into the **AI Answer** column by hand — either works, and you can mix both."
         )
 
-        with st.expander("Connect the AI agent's API", expanded=True):
-            api_url = st.text_input("API endpoint URL", key="api_url", placeholder="https://example.com/api/chat")
+        agent_mode = st.radio(
+            "How is the AI agent reachable?",
+            ["API (HTTP)", "No API — I'll paste answers manually"],
+            key="agent_mode",
+            horizontal=True,
+        )
 
-            col_a, col_b = st.columns(2)
-            with col_a:
-                auth_type = st.selectbox(
-                    "Authentication",
-                    ["None", "Bearer token", "API key header", "API key as query param"],
-                    key="api_auth_type",
+        if agent_mode == "No API — I'll paste answers manually":
+            st.info(
+                "No problem — send each question to the AI agent yourself (chat UI, app, whatever it has), "
+                "then type or paste its answer directly into the **AI Answer** column in the table below."
+            )
+
+        if agent_mode == "API (HTTP)":
+            with st.expander("Connect the AI agent's API", expanded=True):
+                api_url = st.text_input("API endpoint URL", key="api_url", placeholder="https://example.com/api/chat")
+
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    auth_type = st.selectbox(
+                        "Authentication",
+                        ["None", "Bearer token", "API key header", "API key as query param"],
+                        key="api_auth_type",
+                    )
+                with col_b:
+                    auth_value = st.text_input("API key / token", key="api_auth_value", type="password")
+
+                header_name = "x-api-key"
+                if auth_type == "API key header":
+                    header_name = st.text_input("Header name", value="x-api-key", key="api_header_name")
+
+                body_template = st.text_area(
+                    "Request body template — {{question}} gets replaced with each question",
+                    value='{"question": "{{question}}"}',
+                    key="api_body_template",
+                    height=80,
                 )
-            with col_b:
-                auth_value = st.text_input("API key / token", key="api_auth_value", type="password")
+                plain_text_response = st.checkbox(
+                    "Response is plain text (not JSON) — e.g. a streamed chat reply",
+                    value=False,
+                    key="api_plain_text",
+                )
+                response_path = st.text_input(
+                    "Where's the answer in the response? (dot path, e.g. answer or data.reply)",
+                    value="answer",
+                    key="api_response_path",
+                    disabled=plain_text_response,
+                )
 
-            header_name = "x-api-key"
-            if auth_type == "API key header":
-                header_name = st.text_input("Header name", value="x-api-key", key="api_header_name")
+                test_col, send_col = st.columns(2)
 
-            body_template = st.text_area(
-                "Request body template — {{question}} gets replaced with each question",
-                value='{"question": "{{question}}"}',
-                key="api_body_template",
-                height=80,
-            )
-            plain_text_response = st.checkbox(
-                "Response is plain text (not JSON) — e.g. a streamed chat reply",
-                value=False,
-                key="api_plain_text",
-            )
-            response_path = st.text_input(
-                "Where's the answer in the response? (dot path, e.g. answer or data.reply)",
-                value="answer",
-                key="api_response_path",
-                disabled=plain_text_response,
-            )
-
-            test_col, send_col = st.columns(2)
-
-            with test_col:
-                if st.button("Test connection"):
-                    if not api_url:
-                        st.error("Enter an API endpoint URL first.")
-                    else:
-                        try:
-                            headers = build_headers(auth_type, auth_value, header_name)
-                            payload = build_payload(body_template, "Hello, what can you help me with?")
-                            with st.expander("Request sent (debug)"):
-                                st.write("Headers:", {k: v for k, v in headers.items()})
-                                st.write("Payload:", payload)
-                            raw = call_agent_api(api_url, headers, payload, auth_type, auth_value, plain_text_response)
-                            answer = raw.strip() if plain_text_response else resolve_path(raw, response_path)
-                            st.success("Connected. Here's what came back:")
-                            if plain_text_response:
-                                st.text(raw)
-                            else:
-                                st.json(raw)
-                            if answer:
-                                st.markdown(f"**Extracted answer:** {answer}")
-                            else:
-                                st.warning(
-                                    "Got a response but couldn't find an answer at that path — adjust "
-                                    "'Where's the answer in the response?' to match the JSON above."
-                                )
-                        except json.JSONDecodeError:
-                            st.error("Request body template isn't valid JSON.")
-                        except requests.exceptions.RequestException as e:
-                            st.error(f"Request failed: {e}")
-
-            with send_col:
-                overwrite = st.checkbox("Overwrite existing AI Answers", value=False, key="api_overwrite")
-                if st.button("Send all questions to the AI", type="primary"):
-                    if not api_url:
-                        st.error("Enter an API endpoint URL first.")
-                    else:
-                        work = st.session_state.df.copy()
-                        headers = build_headers(auth_type, auth_value, header_name)
-                        progress = st.progress(0.0)
-                        status = st.empty()
-                        total = len(work)
-                        for i, (idx, row) in enumerate(work.iterrows()):
-                            already_answered = str(row["AI Answer"]).strip() != ""
-                            if already_answered and not overwrite:
-                                progress.progress((i + 1) / total)
-                                continue
-                            status.text(f"Sending question {i + 1} of {total}...")
+                with test_col:
+                    if st.button("Test connection"):
+                        if not api_url:
+                            st.error("Enter an API endpoint URL first.")
+                        else:
                             try:
-                                payload = build_payload(body_template, str(row["Question"]))
+                                headers = build_headers(auth_type, auth_value, header_name)
+                                payload = build_payload(body_template, "Hello, what can you help me with?")
+                                with st.expander("Request sent (debug)"):
+                                    st.write("Headers:", {k: v for k, v in headers.items()})
+                                    st.write("Payload:", payload)
                                 raw = call_agent_api(api_url, headers, payload, auth_type, auth_value, plain_text_response)
                                 answer = raw.strip() if plain_text_response else resolve_path(raw, response_path)
-                                if answer:
-                                    work.at[idx, "AI Answer"] = str(answer)
+                                st.success("Connected. Here's what came back:")
+                                if plain_text_response:
+                                    st.text(raw)
                                 else:
-                                    work.at[idx, "Notes"] = "ERROR: no answer found at response path"
+                                    st.json(raw)
+                                if answer:
+                                    st.markdown(f"**Extracted answer:** {answer}")
+                                else:
+                                    st.warning(
+                                        "Got a response but couldn't find an answer at that path — adjust "
+                                        "'Where's the answer in the response?' to match the JSON above."
+                                    )
                             except json.JSONDecodeError:
-                                work.at[idx, "Notes"] = "ERROR: request body template isn't valid JSON"
-                                break
+                                st.error("Request body template isn't valid JSON.")
                             except requests.exceptions.RequestException as e:
-                                work.at[idx, "Notes"] = f"ERROR: {e}"
-                            progress.progress((i + 1) / total)
-                            time.sleep(0.3)
-                        status.text("Done.")
-                        st.session_state.df = ensure_columns(work)
-                        if "editor_qa" in st.session_state:
-                            del st.session_state["editor_qa"]
-                        st.rerun()
+                                st.error(f"Request failed: {e}")
+
+                with send_col:
+                    overwrite = st.checkbox("Overwrite existing AI Answers", value=False, key="api_overwrite")
+                    if st.button("Send all questions to the AI", type="primary"):
+                        if not api_url:
+                            st.error("Enter an API endpoint URL first.")
+                        else:
+                            work = st.session_state.df.copy()
+                            headers = build_headers(auth_type, auth_value, header_name)
+                            progress = st.progress(0.0)
+                            status = st.empty()
+                            total = len(work)
+                            for i, (idx, row) in enumerate(work.iterrows()):
+                                already_answered = str(row["AI Answer"]).strip() != ""
+                                if already_answered and not overwrite:
+                                    progress.progress((i + 1) / total)
+                                    continue
+                                status.text(f"Sending question {i + 1} of {total}...")
+                                try:
+                                    payload = build_payload(body_template, str(row["Question"]))
+                                    raw = call_agent_api(api_url, headers, payload, auth_type, auth_value, plain_text_response)
+                                    answer = raw.strip() if plain_text_response else resolve_path(raw, response_path)
+                                    if answer:
+                                        work.at[idx, "AI Answer"] = str(answer)
+                                    else:
+                                        work.at[idx, "Notes"] = "ERROR: no answer found at response path"
+                                except json.JSONDecodeError:
+                                    work.at[idx, "Notes"] = "ERROR: request body template isn't valid JSON"
+                                    break
+                                except requests.exceptions.RequestException as e:
+                                    work.at[idx, "Notes"] = f"ERROR: {e}"
+                                progress.progress((i + 1) / total)
+                                time.sleep(0.3)
+                            status.text("Done.")
+                            st.session_state.df = ensure_columns(work)
+                            if "editor_qa" in st.session_state:
+                                del st.session_state["editor_qa"]
+                            st.rerun()
 
         edited = st.data_editor(
             st.session_state.df,
