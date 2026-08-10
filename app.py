@@ -249,6 +249,58 @@ def result_from_score(score) -> str:
     return "Pass" if score >= PASS_THRESHOLD else "Fail"
 
 
+def generate_conclusion_text(passed, failed, not_answered, pass_rate, overall_avg, flagged_categories, by_aspect) -> str:
+    total_graded = passed + failed
+    if total_graded == 0:
+        return "No questions have been scored yet — run scoring in tab 3 and score some answers to generate a conclusion here."
+
+    total = passed + failed + not_answered
+    was_were = "was" if total_graded == 1 else "were"
+    sentences = [
+        f"Out of {total} test questions, {total_graded} {was_were} graded: {passed} passed and {failed} failed "
+        f"({pass_rate:.0f}% pass rate, average score {overall_avg:.2f}/3)."
+    ]
+
+    if not by_aspect.empty:
+        rates = {}
+        for aspect in by_aspect.index:
+            p, f = by_aspect.loc[aspect, "Pass"], by_aspect.loc[aspect, "Fail"]
+            if p + f > 0:
+                rates[aspect] = p / (p + f)
+        if rates:
+            best = max(rates, key=rates.get)
+            worst = min(rates, key=rates.get)
+            if best != worst and rates[best] != rates[worst]:
+                sentences.append(f"The agent performed strongest on {best} and weakest on {worst}.")
+            else:
+                sentences.append("Performance was fairly consistent across the aspects that were tested.")
+
+    if flagged_categories:
+        flagged_str = ", ".join(f"{cat} ({gap:.2f} points below average)" for cat, gap in flagged_categories)
+        sentences.append(f"Categories flagged as underperforming: {flagged_str}.")
+    else:
+        sentences.append("No category performed significantly worse than the others.")
+
+    if pass_rate >= 80:
+        verdict = (
+            "Overall, the agent performs well and appears reasonably safe to use as-is, though the flagged "
+            "areas above are still worth a final manual review."
+        )
+    elif pass_rate >= 50:
+        verdict = (
+            "Overall, the agent shows mixed results — improvement is needed in the flagged areas before "
+            "wider use."
+        )
+    else:
+        verdict = (
+            "Overall, the agent shows significant gaps and is not recommended for use without substantial "
+            "improvement first."
+        )
+    sentences.append(verdict)
+
+    return " ".join(sentences)
+
+
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in REQUIRED_COLS:
         if col not in df.columns:
@@ -1204,7 +1256,6 @@ if active_tab == TAB_LABELS[4]:
         valid = scored[scored["Reviewer Score"] >= 0]
 
         agent_desc = st.session_state.get("agent_desc_input", "")
-        conclusion_notes = st.session_state.get("conclusion_notes_input", "")
 
         overall_avg = valid["Reviewer Score"].mean() if not valid.empty else 0
         by_cat = valid.groupby("Category")["Reviewer Score"].mean().sort_values(ascending=False) if not valid.empty else pd.Series(dtype=float)
@@ -1225,6 +1276,13 @@ if active_tab == TAB_LABELS[4]:
         if not by_cat.empty:
             flagged = by_cat[by_cat <= overall_avg - 0.75]
             flagged_categories = [(cat, overall_avg - score) for cat, score in flagged.items()]
+
+        auto_conclusion = generate_conclusion_text(
+            passed, failed, not_answered, pass_rate, overall_avg, flagged_categories, by_aspect
+        )
+        if "conclusion_notes_input" not in st.session_state:
+            st.session_state["conclusion_notes_input"] = auto_conclusion
+        conclusion_notes = st.session_state.get("conclusion_notes_input", "")
 
         pdf_bytes = build_pdf_report(
             agent_desc,
@@ -1273,7 +1331,15 @@ if active_tab == TAB_LABELS[4]:
 
         st.markdown("##### What is this AI agent supposed to do?")
         st.text_area("What is this AI agent supposed to do?", height=80, key="agent_desc_input", label_visibility="collapsed")
-        st.markdown("##### Your conclusion / recommendations")
+
+        concl_label_col, concl_btn_col = st.columns([5, 1])
+        with concl_label_col:
+            st.markdown("##### Your conclusion / recommendations")
+            st.caption("Written automatically from your results — edit it if you want, or regenerate it after rescoring.")
+        with concl_btn_col:
+            if st.button("🔄 Regenerate"):
+                st.session_state["conclusion_notes_input"] = auto_conclusion
+                st.rerun()
         st.text_area(
             "Your conclusion / recommendations (what needs to improve, is it safe to use as-is?)",
             height=100,
