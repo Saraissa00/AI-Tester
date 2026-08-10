@@ -7,7 +7,6 @@ import sqlite3
 from pathlib import Path
 from datetime import date, datetime
 
-import joblib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -862,33 +861,6 @@ def call_agent_api(url: str, headers: dict, payload: dict, auth_type: str, auth_
     return response.json()
 
 
-@st.cache_resource(show_spinner="Loading model...")
-def load_sklearn_model(model_path: str):
-    return joblib.load(model_path)
-
-
-def build_feature_row(question_json: dict, feature_cols: list, value_mappings: dict) -> pd.DataFrame:
-    values = []
-    for col in feature_cols:
-        if col not in question_json:
-            raise KeyError(f"question JSON is missing feature '{col}'")
-        raw = question_json[col]
-        mapping = value_mappings.get(col)
-        if mapping and raw in mapping:
-            values.append(mapping[raw])
-        else:
-            values.append(raw)
-    return pd.DataFrame([values], columns=feature_cols)
-
-
-def call_sklearn_model(model, question_text: str, feature_cols: list, value_mappings: dict, output_mapping: dict):
-    question_json = json.loads(question_text)
-    row = build_feature_row(question_json, feature_cols, value_mappings)
-    prediction = model.predict(row)[0]
-    key = str(prediction)
-    return output_mapping.get(key, str(prediction)), row
-
-
 for key, default in [
     ("df", None),
     ("dataset_df", None),
@@ -1028,221 +1000,110 @@ if active_tab == TAB_LABELS[1]:
             "into the **AI Answer** column by hand — either works, and you can mix both."
         )
 
-        agent_mode = st.radio(
-            "How is the AI agent reachable?",
-            ["API (HTTP)", "Local scikit-learn model"],
-            key="agent_mode",
-            horizontal=True,
-        )
+        with st.expander("Connect the AI agent's API", expanded=True):
+            api_url = st.text_input("API endpoint URL", key="api_url", placeholder="https://example.com/api/chat")
 
-        if agent_mode == "API (HTTP)":
-            with st.expander("Connect the AI agent's API", expanded=True):
-                api_url = st.text_input("API endpoint URL", key="api_url", placeholder="https://example.com/api/chat")
-
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    auth_type = st.selectbox(
-                        "Authentication",
-                        ["None", "Bearer token", "API key header", "API key as query param"],
-                        key="api_auth_type",
-                    )
-                with col_b:
-                    auth_value = st.text_input("API key / token", key="api_auth_value", type="password")
-
-                header_name = "x-api-key"
-                if auth_type == "API key header":
-                    header_name = st.text_input("Header name", value="x-api-key", key="api_header_name")
-
-                body_template = st.text_area(
-                    "Request body template — {{question}} gets replaced with each question",
-                    value='{"question": "{{question}}"}',
-                    key="api_body_template",
-                    height=80,
+            col_a, col_b = st.columns(2)
+            with col_a:
+                auth_type = st.selectbox(
+                    "Authentication",
+                    ["None", "Bearer token", "API key header", "API key as query param"],
+                    key="api_auth_type",
                 )
-                plain_text_response = st.checkbox(
-                    "Response is plain text (not JSON) — e.g. a streamed chat reply",
-                    value=False,
-                    key="api_plain_text",
-                )
-                response_path = st.text_input(
-                    "Where's the answer in the response? (dot path, e.g. answer or data.reply)",
-                    value="answer",
-                    key="api_response_path",
-                    disabled=plain_text_response,
-                )
+            with col_b:
+                auth_value = st.text_input("API key / token", key="api_auth_value", type="password")
 
-                test_col, send_col = st.columns(2)
+            header_name = "x-api-key"
+            if auth_type == "API key header":
+                header_name = st.text_input("Header name", value="x-api-key", key="api_header_name")
 
-                with test_col:
-                    if st.button("Test connection"):
-                        if not api_url:
-                            st.error("Enter an API endpoint URL first.")
-                        else:
+            body_template = st.text_area(
+                "Request body template — {{question}} gets replaced with each question",
+                value='{"question": "{{question}}"}',
+                key="api_body_template",
+                height=80,
+            )
+            plain_text_response = st.checkbox(
+                "Response is plain text (not JSON) — e.g. a streamed chat reply",
+                value=False,
+                key="api_plain_text",
+            )
+            response_path = st.text_input(
+                "Where's the answer in the response? (dot path, e.g. answer or data.reply)",
+                value="answer",
+                key="api_response_path",
+                disabled=plain_text_response,
+            )
+
+            test_col, send_col = st.columns(2)
+
+            with test_col:
+                if st.button("Test connection"):
+                    if not api_url:
+                        st.error("Enter an API endpoint URL first.")
+                    else:
+                        try:
+                            headers = build_headers(auth_type, auth_value, header_name)
+                            payload = build_payload(body_template, "Hello, what can you help me with?")
+                            with st.expander("Request sent (debug)"):
+                                st.write("Headers:", {k: v for k, v in headers.items()})
+                                st.write("Payload:", payload)
+                            raw = call_agent_api(api_url, headers, payload, auth_type, auth_value, plain_text_response)
+                            answer = raw.strip() if plain_text_response else resolve_path(raw, response_path)
+                            st.success("Connected. Here's what came back:")
+                            if plain_text_response:
+                                st.text(raw)
+                            else:
+                                st.json(raw)
+                            if answer:
+                                st.markdown(f"**Extracted answer:** {answer}")
+                            else:
+                                st.warning(
+                                    "Got a response but couldn't find an answer at that path — adjust "
+                                    "'Where's the answer in the response?' to match the JSON above."
+                                )
+                        except json.JSONDecodeError:
+                            st.error("Request body template isn't valid JSON.")
+                        except requests.exceptions.RequestException as e:
+                            st.error(f"Request failed: {e}")
+
+            with send_col:
+                overwrite = st.checkbox("Overwrite existing AI Answers", value=False, key="api_overwrite")
+                if st.button("Send all questions to the AI", type="primary"):
+                    if not api_url:
+                        st.error("Enter an API endpoint URL first.")
+                    else:
+                        work = st.session_state.df.copy()
+                        headers = build_headers(auth_type, auth_value, header_name)
+                        progress = st.progress(0.0)
+                        status = st.empty()
+                        total = len(work)
+                        for i, (idx, row) in enumerate(work.iterrows()):
+                            already_answered = str(row["AI Answer"]).strip() != ""
+                            if already_answered and not overwrite:
+                                progress.progress((i + 1) / total)
+                                continue
+                            status.text(f"Sending question {i + 1} of {total}...")
                             try:
-                                headers = build_headers(auth_type, auth_value, header_name)
-                                payload = build_payload(body_template, "Hello, what can you help me with?")
-                                with st.expander("Request sent (debug)"):
-                                    st.write("Headers:", {k: v for k, v in headers.items()})
-                                    st.write("Payload:", payload)
+                                payload = build_payload(body_template, str(row["Question"]))
                                 raw = call_agent_api(api_url, headers, payload, auth_type, auth_value, plain_text_response)
                                 answer = raw.strip() if plain_text_response else resolve_path(raw, response_path)
-                                st.success("Connected. Here's what came back:")
-                                if plain_text_response:
-                                    st.text(raw)
-                                else:
-                                    st.json(raw)
                                 if answer:
-                                    st.markdown(f"**Extracted answer:** {answer}")
+                                    work.at[idx, "AI Answer"] = str(answer)
                                 else:
-                                    st.warning(
-                                        "Got a response but couldn't find an answer at that path — adjust "
-                                        "'Where's the answer in the response?' to match the JSON above."
-                                    )
+                                    work.at[idx, "Notes"] = "ERROR: no answer found at response path"
                             except json.JSONDecodeError:
-                                st.error("Request body template isn't valid JSON.")
+                                work.at[idx, "Notes"] = "ERROR: request body template isn't valid JSON"
+                                break
                             except requests.exceptions.RequestException as e:
-                                st.error(f"Request failed: {e}")
-
-                with send_col:
-                    overwrite = st.checkbox("Overwrite existing AI Answers", value=False, key="api_overwrite")
-                    if st.button("Send all questions to the AI", type="primary"):
-                        if not api_url:
-                            st.error("Enter an API endpoint URL first.")
-                        else:
-                            work = st.session_state.df.copy()
-                            headers = build_headers(auth_type, auth_value, header_name)
-                            progress = st.progress(0.0)
-                            status = st.empty()
-                            total = len(work)
-                            for i, (idx, row) in enumerate(work.iterrows()):
-                                already_answered = str(row["AI Answer"]).strip() != ""
-                                if already_answered and not overwrite:
-                                    progress.progress((i + 1) / total)
-                                    continue
-                                status.text(f"Sending question {i + 1} of {total}...")
-                                try:
-                                    payload = build_payload(body_template, str(row["Question"]))
-                                    raw = call_agent_api(api_url, headers, payload, auth_type, auth_value, plain_text_response)
-                                    answer = raw.strip() if plain_text_response else resolve_path(raw, response_path)
-                                    if answer:
-                                        work.at[idx, "AI Answer"] = str(answer)
-                                    else:
-                                        work.at[idx, "Notes"] = "ERROR: no answer found at response path"
-                                except json.JSONDecodeError:
-                                    work.at[idx, "Notes"] = "ERROR: request body template isn't valid JSON"
-                                    break
-                                except requests.exceptions.RequestException as e:
-                                    work.at[idx, "Notes"] = f"ERROR: {e}"
-                                progress.progress((i + 1) / total)
-                                time.sleep(0.3)
-                            status.text("Done.")
-                            st.session_state.df = ensure_columns(work)
-                            if "editor_qa" in st.session_state:
-                                del st.session_state["editor_qa"]
-                            st.rerun()
-
-        if agent_mode == "Local scikit-learn model":
-            with st.expander("Connect a local scikit-learn model", expanded=True):
-                st.caption(
-                    "For structured-input models (classifiers/regressors) instead of chat APIs. "
-                    "Each row's **Question** column should hold a JSON object of feature values, e.g. "
-                    '`{"satisfaction_level": 0.11, "salary": "Medium"}`.'
-                )
-                model_path = st.text_input(
-                    "Path to the model file (.pkl, joblib-loadable)",
-                    key="sk_model_path",
-                    placeholder=r"C:\path\to\models\model.pkl",
-                )
-                feature_cols_text = st.text_area(
-                    "Feature columns, one per line, in the exact order the model expects",
-                    key="sk_feature_cols",
-                    height=120,
-                    placeholder="satisfaction_level\nlast_evaluation\nnumber_project\n...",
-                )
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    value_mappings_text = st.text_area(
-                        "Value mappings (JSON) — translate categorical inputs to the numbers the model expects",
-                        key="sk_value_mappings",
-                        height=120,
-                        value='{\n  "salary": {"Low": 1, "Medium": 2, "High": 0}\n}',
-                    )
-                with col_b:
-                    output_mapping_text = st.text_area(
-                        "Output mapping (JSON) — translate the model's raw prediction to a readable answer",
-                        key="sk_output_mapping",
-                        height=120,
-                        value='{\n  "0": "STAY",\n  "1": "LEAVE"\n}',
-                    )
-
-                sk_test_col, sk_send_col = st.columns(2)
-
-                with sk_test_col:
-                    if st.button("Test connection", key="sk_test_btn"):
-                        if not model_path:
-                            st.error("Enter a model file path first.")
-                        else:
-                            try:
-                                feature_cols = [c.strip() for c in feature_cols_text.splitlines() if c.strip()]
-                                value_mappings = json.loads(value_mappings_text) if value_mappings_text.strip() else {}
-                                output_mapping = json.loads(output_mapping_text) if output_mapping_text.strip() else {}
-                                model = load_sklearn_model(model_path)
-                                sample_question = str(st.session_state.df.iloc[0]["Question"]) if len(st.session_state.df) else "{}"
-                                answer, row = call_sklearn_model(model, sample_question, feature_cols, value_mappings, output_mapping)
-                                st.success(f"Model loaded ({type(model).__name__}). Test prediction on row 1:")
-                                st.write("Feature row sent to the model:", row)
-                                st.markdown(f"**Answer:** {answer}")
-                            except FileNotFoundError:
-                                st.error(f"No file found at: {model_path}")
-                            except json.JSONDecodeError as e:
-                                st.error(f"Value/output mapping or Question isn't valid JSON: {e}")
-                            except Exception as e:
-                                st.error(f"Prediction failed: {e}")
-
-                with sk_send_col:
-                    sk_overwrite = st.checkbox("Overwrite existing AI Answers", value=False, key="sk_overwrite")
-                    if st.button("Send all questions to the AI", type="primary", key="sk_send_btn"):
-                        if not model_path:
-                            st.error("Enter a model file path first.")
-                        else:
-                            try:
-                                feature_cols = [c.strip() for c in feature_cols_text.splitlines() if c.strip()]
-                                value_mappings = json.loads(value_mappings_text) if value_mappings_text.strip() else {}
-                                output_mapping = json.loads(output_mapping_text) if output_mapping_text.strip() else {}
-                                model = load_sklearn_model(model_path)
-                            except FileNotFoundError:
-                                st.error(f"No file found at: {model_path}")
-                                model = None
-                            except json.JSONDecodeError as e:
-                                st.error(f"Value/output mapping isn't valid JSON: {e}")
-                                model = None
-
-                            if model is not None:
-                                work = st.session_state.df.copy()
-                                progress = st.progress(0.0)
-                                status = st.empty()
-                                total = len(work)
-                                for i, (idx, row) in enumerate(work.iterrows()):
-                                    already_answered = str(row["AI Answer"]).strip() != ""
-                                    if already_answered and not sk_overwrite:
-                                        progress.progress((i + 1) / total)
-                                        continue
-                                    status.text(f"Predicting question {i + 1} of {total}...")
-                                    try:
-                                        answer, _ = call_sklearn_model(model, str(row["Question"]), feature_cols, value_mappings, output_mapping)
-                                        work.at[idx, "AI Answer"] = str(answer)
-                                    except json.JSONDecodeError:
-                                        work.at[idx, "Notes"] = "ERROR: Question isn't valid JSON"
-                                    except KeyError as e:
-                                        work.at[idx, "Notes"] = f"ERROR: {e}"
-                                    except Exception as e:
-                                        work.at[idx, "Notes"] = f"ERROR: {e}"
-                                    progress.progress((i + 1) / total)
-                                status.text("Done.")
-                                st.session_state.df = ensure_columns(work)
-                                if "editor_qa" in st.session_state:
-                                    del st.session_state["editor_qa"]
-                                st.rerun()
+                                work.at[idx, "Notes"] = f"ERROR: {e}"
+                            progress.progress((i + 1) / total)
+                            time.sleep(0.3)
+                        status.text("Done.")
+                        st.session_state.df = ensure_columns(work)
+                        if "editor_qa" in st.session_state:
+                            del st.session_state["editor_qa"]
+                        st.rerun()
 
         edited = st.data_editor(
             st.session_state.df,
