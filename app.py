@@ -4,6 +4,9 @@ import json
 import time
 import difflib
 import sqlite3
+import hashlib
+import secrets
+import textwrap
 from pathlib import Path
 from datetime import date, datetime
 
@@ -66,6 +69,18 @@ def init_db():
     conn = get_conn()
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'tester',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -74,6 +89,9 @@ def init_db():
         )
         """
     )
+    existing_project_cols = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+    if "user_id" not in existing_project_cols:
+        conn.execute("ALTER TABLE projects ADD COLUMN user_id INTEGER")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS runs (
@@ -122,12 +140,80 @@ def init_db():
     conn.close()
 
 
-def create_project(name: str, short_name: str) -> int:
+def hash_password(password: str, salt: str = None) -> tuple:
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000)
+    return digest.hex(), salt
+
+
+def verify_password(password: str, salt: str, expected_hash: str) -> bool:
+    computed, _ = hash_password(password, salt)
+    return secrets.compare_digest(computed, expected_hash)
+
+
+def create_user(username: str, password: str, role: str = "tester") -> int:
+    pw_hash, salt = hash_password(password)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO projects (name, short_name, created_at) VALUES (?, ?, ?)",
-        (name, short_name, datetime.now().isoformat(timespec="seconds")),
+        "INSERT INTO users (username, password_hash, salt, role, created_at) VALUES (?, ?, ?, ?, ?)",
+        (username, pw_hash, salt, role, datetime.now().isoformat(timespec="seconds")),
+    )
+    user_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return user_id
+
+
+def get_user_by_username(username: str):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id, username, password_hash, salt, role FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def fetch_users() -> pd.DataFrame:
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT id, username, role, created_at FROM users ORDER BY created_at", conn
+    )
+    conn.close()
+    return df
+
+
+def rename_user(user_id: int, new_username: str):
+    conn = get_conn()
+    conn.execute("UPDATE users SET username = ? WHERE id = ?", (new_username, user_id))
+    conn.commit()
+    conn.close()
+
+
+def change_user_password(user_id: int, new_password: str):
+    pw_hash, salt = hash_password(new_password)
+    conn = get_conn()
+    conn.execute(
+        "UPDATE users SET password_hash = ?, salt = ? WHERE id = ?", (pw_hash, salt, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def ensure_default_admin():
+    conn = get_conn()
+    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+    if count == 0:
+        create_user("admin", "admin123", role="admin")
+
+
+def create_project(name: str, short_name: str, user_id: int) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO projects (name, short_name, created_at, user_id) VALUES (?, ?, ?, ?)",
+        (name, short_name, datetime.now().isoformat(timespec="seconds"), user_id),
     )
     project_id = cur.lastrowid
     conn.commit()
@@ -135,11 +221,27 @@ def create_project(name: str, short_name: str) -> int:
     return project_id
 
 
-def fetch_projects() -> pd.DataFrame:
+def delete_project(project_id: int):
     conn = get_conn()
-    df = pd.read_sql_query(
-        "SELECT id, name, short_name, created_at FROM projects ORDER BY created_at DESC", conn
-    )
+    run_ids = [row[0] for row in conn.execute("SELECT id FROM runs WHERE project_id = ?", (project_id,))]
+    if run_ids:
+        placeholders = ",".join("?" * len(run_ids))
+        conn.execute(f"DELETE FROM run_questions WHERE run_id IN ({placeholders})", run_ids)
+        conn.execute("DELETE FROM runs WHERE project_id = ?", (project_id,))
+    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    conn.commit()
+    conn.close()
+
+
+def fetch_projects(user_id=None, role=None) -> pd.DataFrame:
+    conn = get_conn()
+    query = "SELECT id, name, short_name, created_at, user_id FROM projects"
+    params = ()
+    if role != "admin" and user_id is not None:
+        query += " WHERE user_id = ?"
+        params = (user_id,)
+    query += " ORDER BY created_at DESC"
+    df = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return df
 
@@ -191,7 +293,7 @@ def save_run(project_id, project_name, agent_desc, dataset_name, about_name, tot
     return run_id
 
 
-def fetch_runs(project_id=None) -> pd.DataFrame:
+def fetch_runs(project_id=None, owner_user_id=None) -> pd.DataFrame:
     conn = get_conn()
     query = (
         "SELECT id AS 'Run #', COALESCE(project_name, '(unnamed)') AS 'Project', created_at AS 'Saved At', "
@@ -199,55 +301,139 @@ def fetch_runs(project_id=None) -> pd.DataFrame:
         "passed AS 'Passed', failed AS 'Failed', pass_rate AS 'Pass Rate %', overall_avg AS 'Avg Score' "
         "FROM runs"
     )
-    params = ()
+    conditions, params = [], []
     if project_id is not None:
-        query += " WHERE project_id = ?"
-        params = (project_id,)
+        conditions.append("project_id = ?")
+        params.append(project_id)
+    if owner_user_id is not None:
+        conditions.append("project_id IN (SELECT id FROM projects WHERE user_id = ?)")
+        params.append(owner_user_id)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY created_at DESC"
-    df = pd.read_sql_query(query, conn, params=params)
+    df = pd.read_sql_query(query, conn, params=tuple(params))
     conn.close()
     return df
 
 
 init_db()
+ensure_default_admin()
 
 st.set_page_config(page_title="AI Tester", page_icon="\U0001F9EA", layout="wide")
 
+# Palette — white canvas, dark-navy sidebar, baby-blue accent.
+INK = "#181C2A"
+MUTED = "#6B7280"
+BORDER = "#ECEAF5"
+CARD = "#FFFFFF"
+PILL_BG = "#F3F1FC"
+TEAL = "#4FA8D8"
+TEAL_DARK = "#2E86C1"
+NAVY = "#0B1F3A"
+NAVY_ACCENT = "#1B3A66"
+NAVY_TEXT = "#E8EDF7"
+NAVY_TEXT_MUTED = "#A9B7D1"
+LOGOUT_RED = "#C0392B"
+LOGOUT_RED_DARK = "#922B21"
+
+# Opens with the literal "<style>" as the very first line so CommonMark parses
+# this as a raw HTML block that only ends at "</style>" — a plain indented
+# <div> block would instead get cut at the first blank line inside the CSS
+# and the rest would render as literal text.
 st.markdown(
-    """
+    textwrap.dedent(f"""\
     <style>
-    html, body, [class*="css"] { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+    html, body, [class*="css"] {{ font-family: -apple-system, "Segoe UI", Roboto, sans-serif; color: {INK}; }}
+    .stApp {{
+        background-color: #FFFFFF;
+    }}
 
-    h1, h2, h3 { color: #211B2E; font-weight: 650; letter-spacing: -0.01em; }
+    h1, h2, h3 {{ font-family: Georgia, "Times New Roman", serif; color: {INK}; font-weight: 600; letter-spacing: -0.01em; }}
 
-    div[role="radiogroup"] { gap: 4px; border-bottom: 1px solid #E5E1EE; padding-bottom: 10px; }
-    div[role="radiogroup"] label { color: #6B6478; font-weight: 500; padding: 6px 4px; }
-    div[role="radiogroup"] label:has(input:checked) { color: #7C3AED !important; font-weight: 650; }
-    div[role="radiogroup"] label > div:first-child { display: none; }
+    section[data-testid="stSidebar"] {{
+        background-color: {NAVY};
+        border-right: 1px solid {NAVY};
+    }}
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] span,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3,
+    section[data-testid="stSidebar"] h4,
+    section[data-testid="stSidebar"] .stMarkdown {{
+        color: {NAVY_TEXT} !important;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {{
+        color: {NAVY_TEXT_MUTED} !important;
+    }}
+    section[data-testid="stSidebar"] button {{
+        color: {LOGOUT_RED} !important;
+        border-color: {LOGOUT_RED} !important;
+        border-radius: 4px !important;
+        background-color: #FFFFFF !important;
+    }}
+    section[data-testid="stSidebar"] button p,
+    section[data-testid="stSidebar"] button span,
+    section[data-testid="stSidebar"] button div {{
+        color: {LOGOUT_RED} !important;
+    }}
+    section[data-testid="stSidebar"] button:hover {{
+        color: #FFFFFF !important;
+        border-color: {LOGOUT_RED_DARK} !important;
+        background-color: {LOGOUT_RED_DARK} !important;
+    }}
+    section[data-testid="stSidebar"] button:hover p,
+    section[data-testid="stSidebar"] button:hover span,
+    section[data-testid="stSidebar"] button:hover div {{
+        color: #FFFFFF !important;
+    }}
+    section[data-testid="stSidebar"] div[role="radiogroup"] label {{
+        color: {NAVY_TEXT_MUTED} !important;
+    }}
+    section[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) {{
+        background-color: {NAVY_ACCENT} !important;
+        color: #FFFFFF !important;
+    }}
 
-    .stMetric {
-        background-color: #F5F3FA;
-        border: 1px solid #E5E1EE;
+    div[role="radiogroup"] {{ gap: 4px; }}
+    div[role="radiogroup"] label {{
+        color: {MUTED};
+        font-weight: 500;
+        padding: 9px 14px;
         border-radius: 10px;
-        padding: 16px 18px;
-    }
-    div[data-testid="stMetricValue"] { color: #4C1D95; font-weight: 700; }
-    div[data-testid="stMetricLabel"] { color: #7C3AED; font-size: 0.85rem; }
+    }}
+    div[role="radiogroup"] label:has(input:checked) {{
+        background-color: {PILL_BG} !important;
+        color: {INK} !important;
+        font-weight: 650;
+    }}
+    div[role="radiogroup"] label > div:first-child {{ display: none; }}
 
-    .flag-box {
-        background-color: #FFFBEB;
+    .stMetric {{
+        background-color: {CARD};
+        border: 1px solid {BORDER};
+        border-radius: 16px;
+        padding: 16px 18px;
+        box-shadow: 0 1px 3px rgba(24,28,42,0.06);
+    }}
+    div[data-testid="stMetricValue"] {{ color: {INK}; font-weight: 700; }}
+    div[data-testid="stMetricLabel"] {{ color: {TEAL}; font-size: 0.85rem; }}
+
+    .flag-box {{
+        background-color: #FFF4E8;
         border-left: 4px solid #D97706;
         padding: 14px 18px;
-        border-radius: 8px;
+        border-radius: 12px;
         margin-bottom: 10px;
         color: #78350F;
-    }
-    .flag-box b { color: #78350F; }
+    }}
+    .flag-box b {{ color: #78350F; }}
 
-    .setup-card {
-        background-color: #F5F3FA;
-        border: 1px solid #E5E1EE;
-        border-radius: 12px;
+    .setup-card {{
+        background-color: {CARD};
+        border: 1px solid {BORDER};
+        border-radius: 18px;
         padding: 18px 20px;
         margin-bottom: 12px;
         height: 150px;
@@ -255,31 +441,46 @@ st.markdown(
         display: flex;
         flex-direction: column;
         justify-content: center;
-    }
-    .setup-card h4 { color: #4C1D95; margin-top: 0; }
-    .setup-card p { color: #5B21B6; margin-bottom: 0; }
+        box-shadow: 0 1px 3px rgba(24,28,42,0.06);
+    }}
+    .setup-card h4 {{ color: {TEAL}; margin-top: 0; }}
+    .setup-card p {{ color: {MUTED}; margin-bottom: 0; }}
 
-    button[kind="secondary"] {
-        color: #7C3AED !important;
-        border-color: #C4B5FD !important;
-    }
-    button[kind="secondary"]:hover {
-        color: #5B21B6 !important;
-        border-color: #7C3AED !important;
-        background-color: #F5F3FA !important;
-    }
+    button[kind="primary"] {{
+        background-color: {TEAL} !important;
+        border-color: {TEAL} !important;
+        color: #FFFFFF !important;
+        border-radius: 999px !important;
+        font-weight: 600;
+    }}
+    button[kind="primary"]:hover {{
+        background-color: {TEAL_DARK} !important;
+        border-color: {TEAL_DARK} !important;
+    }}
+    button[kind="secondary"] {{
+        color: {TEAL} !important;
+        border-color: #D8D4EE !important;
+        border-radius: 999px !important;
+    }}
+    button[kind="secondary"]:hover {{
+        color: {TEAL_DARK} !important;
+        border-color: {TEAL} !important;
+        background-color: {PILL_BG} !important;
+    }}
 
-    section[data-testid="stFileUploaderDropzone"] {
-        background-color: #F5F3FA;
-        border: 1px solid #E5E1EE;
-        border-radius: 12px;
+    section[data-testid="stFileUploaderDropzone"] {{
+        background-color: {CARD};
+        border: 1px dashed #D8D4EE;
+        border-radius: 16px;
         min-height: 84px;
         display: flex;
         align-items: center;
-    }
+    }}
 
+    div[data-testid="stAlert"] {{ border-radius: 12px; border: 1px solid {BORDER}; }}
+    div[data-testid="stExpander"] {{ border-radius: 12px !important; border: 1px solid {BORDER} !important; }}
     </style>
-    """,
+    """),
     unsafe_allow_html=True,
 )
 
@@ -332,7 +533,7 @@ def result_from_score(score) -> str:
 def generate_conclusion_text(passed, failed, not_answered, pass_rate, overall_avg, flagged_categories, by_aspect) -> str:
     total_graded = passed + failed
     if total_graded == 0:
-        return "No questions have been scored yet — run scoring in tab 3 and score some answers to generate a conclusion here."
+        return "No questions have been scored yet — run scoring in the Test & Score tab and score some answers to generate a conclusion here."
 
     total = passed + failed + not_answered
     was_were = "was" if total_graded == 1 else "were"
@@ -540,8 +741,8 @@ def build_final_results_report(scored_df: pd.DataFrame) -> pd.DataFrame:
     return report
 
 
-PDF_PURPLE = (124, 58, 237)
-PDF_PURPLE_DARK = (76, 29, 149)
+PDF_PURPLE = (79, 168, 216)
+PDF_PURPLE_DARK = (46, 134, 193)
 PDF_INK = (33, 27, 46)
 PDF_MUTED = (107, 100, 120)
 PDF_GREEN = (22, 163, 74)
@@ -557,7 +758,7 @@ def _style_axes(ax):
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.tick_params(left=False, labelsize=9, colors="#3F3A4B")
-    ax.xaxis.grid(True, color="#E5E1EE", linewidth=0.8)
+    ax.xaxis.grid(True, color="#ECEAF5", linewidth=0.8)
     ax.set_axisbelow(True)
 
 
@@ -578,7 +779,7 @@ def bar_chart_png(series: pd.Series, title: str, xlabel: str, xlim=None) -> byte
     ordered = series.iloc[::-1]
     fig_h_in = _fig_height_in(len(ordered), BAR_CHART_DIMS["base_in"], BAR_CHART_DIMS["per_item_in"], BAR_CHART_DIMS["min_in"])
     fig, ax = plt.subplots(figsize=(BAR_CHART_DIMS["fig_w_in"], fig_h_in), dpi=160)
-    bars = ax.barh(ordered.index, ordered.values, color="#7C3AED", height=0.55)
+    bars = ax.barh(ordered.index, ordered.values, color="#4FA8D8", height=0.55)
     ax.set_title(title, fontsize=12, fontweight="bold", color="#211B2E", loc="left", pad=10)
     ax.set_xlabel(xlabel, fontsize=9, color="#6B6478")
     if xlim:
@@ -946,13 +1147,21 @@ def call_agent_api(url: str, headers: dict, payload: dict, auth_type: str, auth_
 ANTHROPIC_MODEL = "claude-sonnet-5"
 DEEPSEEK_MODEL = "deepseek-chat"
 GROQ_MODEL = "openai/gpt-oss-20b"
+OPENROUTER_MODEL = "openai/gpt-oss-20b:free"
+
+# provider -> (chat-completions URL, model). All three are OpenAI-compatible.
+OPENAI_COMPATIBLE_PROVIDERS = {
+    "DeepSeek": ("https://api.deepseek.com/chat/completions", DEEPSEEK_MODEL),
+    "Groq": ("https://api.groq.com/openai/v1/chat/completions", GROQ_MODEL),
+    "OpenRouter": ("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_MODEL),
+}
 
 
 def get_ai_api_key():
     api_key = st.session_state.get("ai_api_key_input")
     if api_key:
         return api_key
-    for secret_name in ("ANTHROPIC_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY"):
+    for secret_name in ("ANTHROPIC_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"):
         try:
             val = st.secrets.get(secret_name)
         except Exception:
@@ -969,6 +1178,8 @@ def get_ai_provider() -> str:
             return "Anthropic (Claude)"
         if api_key.startswith("gsk_"):
             return "Groq"
+        if api_key.startswith("sk-or-"):
+            return "OpenRouter"
         return "DeepSeek"
     return "Anthropic (Claude)"
 
@@ -1000,13 +1211,8 @@ def call_ai_text(
             f"No {provider} API key configured. Paste one above, or add it to .streamlit/secrets.toml."
         )
 
-    if provider in ("DeepSeek", "Groq"):
-        url = (
-            "https://api.deepseek.com/chat/completions"
-            if provider == "DeepSeek"
-            else "https://api.groq.com/openai/v1/chat/completions"
-        )
-        model = DEEPSEEK_MODEL if provider == "DeepSeek" else GROQ_MODEL
+    if provider in OPENAI_COMPATIBLE_PROVIDERS:
+        url, model = OPENAI_COMPATIBLE_PROVIDERS[provider]
         body = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -1235,6 +1441,37 @@ Respond with ONLY a JSON object, no prose: {{"score": 0-3, "reasoning": "one sho
     return int(result.get("score", 0)), str(result.get("reasoning", ""))
 
 
+def login_screen():
+    st.markdown(
+        '<div style="max-width:420px;margin:8vh auto 0 auto;text-align:center;">'
+        '<h1 style="margin-bottom:4px;">AI Tester</h1>'
+        '<p style="color:#6B7280;margin-top:0;">Sign in to test and score an AI agent.</p>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Log in", type="primary", use_container_width=True)
+        if submitted:
+            row = get_user_by_username(username.strip())
+            if row and verify_password(password, row[3], row[2]):
+                st.session_state["user"] = {"id": row[0], "username": row[1], "role": row[4]}
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+        st.caption("First time here? Default admin login is **admin / admin123** — change it after logging in.")
+
+
+if "user" not in st.session_state:
+    login_screen()
+    st.stop()
+
+CURRENT_USER = st.session_state["user"]
+IS_ADMIN = CURRENT_USER["role"] == "admin"
+
 for key, default in [
     ("df", None),
     ("dataset_df", None),
@@ -1249,59 +1486,28 @@ for key, default in [
 st.title("AI Tester")
 st.caption("A one-time evaluation of how well an existing AI agent answers questions.")
 
-TAB_LABELS = [
-    "Home",
-    "Projects",
-    "1. Setup",
-    "2. Send Questions to the AI",
-    "3. Evaluate the Answers",
-    "4. Detect Bias",
-    "5. Dashboard",
-    "6. Conclusion & Analysis",
-]
+TAB_LABELS = ["Projects", "Setup", "Test & Score", "Results"]
+if IS_ADMIN:
+    TAB_LABELS = TAB_LABELS + ["Users"]
 
 if "_goto_tab" in st.session_state:
     st.session_state["active_tab"] = st.session_state.pop("_goto_tab")
 
-
-def step_is_complete(current_tab) -> bool:
-    df = st.session_state.df
-    if current_tab == "Projects":
-        return st.session_state.get("current_project_id") is not None
-    if current_tab == "Home":
-        return True
-    if current_tab == "1. Setup":
-        return (
-            st.session_state.get("current_project_id") is not None
-            and st.session_state.about_text is not None
-            and df is not None
-        )
-    if current_tab == "2. Send Questions to the AI":
-        return df is not None and (df["AI Answer"].astype(str).str.strip() != "").all()
-    if current_tab in ("3. Evaluate the Answers", "4. Detect Bias"):
-        return "scored_df" in st.session_state
-    return True
-
-
-def next_button(current_tab):
-    idx = TAB_LABELS.index(current_tab)
-    if idx < len(TAB_LABELS) - 1:
-        button_type = "primary" if step_is_complete(current_tab) else "secondary"
-        if st.button("Next →", key=f"next_{idx}", type=button_type):
-            st.session_state["_goto_tab"] = TAB_LABELS[idx + 1]
-            st.rerun()
-
-
 with st.sidebar:
-    st.markdown("### Your Progress")
-    st.caption("Click a step to jump there, or use Next → at the top of each page to go in order.")
+    user_col, logout_col = st.columns([2, 1])
+    with user_col:
+        st.markdown(f"**{CURRENT_USER['username']}**")
+        st.caption("Admin" if IS_ADMIN else "Tester")
+    with logout_col:
+        if st.button("Log out", key="logout_btn", use_container_width=True):
+            del st.session_state["user"]
+            st.rerun()
+    st.markdown("### Navigation")
     active_tab = st.radio(
         "Navigation", TAB_LABELS, key="active_tab", label_visibility="collapsed"
     )
 
-next_button(active_tab)
-
-if active_tab == TAB_LABELS[1]:
+if active_tab == "Projects":
     st.markdown("### Projects")
     st.caption(
         "Every AI agent you test lives under a project — its dataset, spec, test cases, and saved run "
@@ -1321,23 +1527,25 @@ if active_tab == TAB_LABELS[1]:
             st.error("Enter a project name.")
         else:
             short = new_short.strip() or re.sub(r"[^A-Za-z0-9]+", "", new_name.strip())[:12] or "Project"
-            pid = create_project(new_name.strip(), short)
+            pid = create_project(new_name.strip(), short, CURRENT_USER["id"])
             st.session_state["current_project_id"] = pid
             st.session_state["current_project_name"] = new_name.strip()
             st.session_state["current_project_short"] = short
-            st.session_state["_goto_tab"] = TAB_LABELS[2]
+            st.session_state["_goto_tab"] = "Setup"
             st.success(f"Project '{new_name.strip()}' created — taking you to Setup.")
             st.rerun()
 
-    st.markdown("##### Your projects")
-    projects_df = fetch_projects()
+    st.markdown("##### Your projects" if not IS_ADMIN else "##### All projects")
+    projects_df = fetch_projects(CURRENT_USER["id"], CURRENT_USER["role"])
     if projects_df.empty:
         st.info("No projects yet — add one above to get started.")
     else:
         for _, proj in projects_df.iterrows():
-            runs_count = len(fetch_runs(project_id=int(proj["id"])))
+            proj_id = int(proj["id"])
+            runs_count = len(fetch_runs(project_id=proj_id))
             is_current = st.session_state.get("current_project_id") == proj["id"]
-            p_col1, p_col2, p_col3 = st.columns([3, 2, 1])
+            can_delete = IS_ADMIN or proj["user_id"] == CURRENT_USER["id"]
+            p_col1, p_col2, p_col3, p_col4 = st.columns([3, 2, 1, 1])
             with p_col1:
                 label = f"**{proj['name']}**" + (" 🟣 *(current)*" if is_current else "")
                 st.markdown(label)
@@ -1345,33 +1553,38 @@ if active_tab == TAB_LABELS[1]:
             with p_col2:
                 st.caption(f"{runs_count} run(s) saved to history")
             with p_col3:
-                if st.button("Open →", key=f"open_project_{proj['id']}"):
-                    st.session_state["current_project_id"] = int(proj["id"])
+                if st.button("Open →", key=f"open_project_{proj_id}"):
+                    st.session_state["current_project_id"] = proj_id
                     st.session_state["current_project_name"] = proj["name"]
                     st.session_state["current_project_short"] = proj["short_name"]
-                    st.session_state["_goto_tab"] = TAB_LABELS[2]
+                    st.session_state["_goto_tab"] = "Setup"
                     st.rerun()
+            with p_col4:
+                if can_delete:
+                    if st.button("Delete", key=f"delete_project_{proj_id}"):
+                        st.session_state[f"confirm_delete_{proj_id}"] = True
+                        st.rerun()
+            if st.session_state.get(f"confirm_delete_{proj_id}"):
+                st.warning(
+                    f"Delete '{proj['name']}' and all {runs_count} saved run(s)? This can't be undone."
+                )
+                confirm_col, cancel_col = st.columns(2)
+                with confirm_col:
+                    if st.button("Yes, delete it", key=f"confirm_delete_yes_{proj_id}", type="primary"):
+                        delete_project(proj_id)
+                        del st.session_state[f"confirm_delete_{proj_id}"]
+                        if st.session_state.get("current_project_id") == proj_id:
+                            for key in ("current_project_id", "current_project_name", "current_project_short"):
+                                st.session_state.pop(key, None)
+                        st.success(f"Deleted '{proj['name']}'.")
+                        st.rerun()
+                with cancel_col:
+                    if st.button("Cancel", key=f"confirm_delete_no_{proj_id}"):
+                        del st.session_state[f"confirm_delete_{proj_id}"]
+                        st.rerun()
             st.markdown("---")
 
-if active_tab == TAB_LABELS[0]:
-    st.markdown("### Welcome")
-    st.markdown("This tool walks you through testing an AI agent, one step at a time:")
-    st.markdown(
-        "1. **Setup** — tell it what the AI is supposed to do, and build your test cases\n"
-        "2. **Send Questions** — get the AI's answers to your test cases\n"
-        "3. **Evaluate** — score each answer right or wrong\n"
-        "4. **Detect Bias** — check if it treats some inputs unfairly\n"
-        "5. **Dashboard** — see all results in one place\n"
-        "6. **Conclusion** — download the final report\n\n"
-        "Head to **1. Setup** using the **Your Progress** menu in the sidebar (or the **Next →** button) to get started."
-    )
-    current_proj_name = st.session_state.get("current_project_name")
-    if current_proj_name:
-        st.caption(f"Current project: **{current_proj_name}**. Not the right one? Switch it in the **Projects** tab.")
-    else:
-        st.warning("No project selected yet — head to the **Projects** tab first to add or open one.")
-
-if active_tab == TAB_LABELS[2]:
+if active_tab == "Setup":
     if st.session_state.get("current_project_id") is None:
         st.warning("No project selected. Head to the **Projects** tab to add or open one before continuing.")
         st.stop()
@@ -1381,7 +1594,7 @@ if active_tab == TAB_LABELS[2]:
         st.caption(f"Working on project: **{st.session_state.get('current_project_name', '')}**")
     with switch_col:
         if st.button("Switch project"):
-            st.session_state["_goto_tab"] = TAB_LABELS[1]
+            st.session_state["_goto_tab"] = "Projects"
             st.rerun()
 
     st.markdown(
@@ -1391,7 +1604,7 @@ if active_tab == TAB_LABELS[2]:
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.markdown('<div class="setup-card"><h4>1. Dataset</h4><p>The data this AI was trained on, used as ground truth to judge its answers.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="setup-card"><h4>Dataset</h4><p>The data this AI was trained on, used as ground truth to judge its answers.</p></div>', unsafe_allow_html=True)
         dataset_file = st.file_uploader("Upload dataset", type=["csv", "xlsx", "xls", "txt"], key="dataset_upl", label_visibility="collapsed")
         if dataset_file is not None and dataset_file.file_id != st.session_state.get("_dataset_file_id"):
             df_data, text_data = load_dataset(dataset_file)
@@ -1401,7 +1614,7 @@ if active_tab == TAB_LABELS[2]:
             st.session_state["_dataset_file_id"] = dataset_file.file_id
 
     with col2:
-        st.markdown('<div class="setup-card"><h4>2. About the AI</h4><p>A document explaining what this AI is and what it\'s supposed to do.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="setup-card"><h4>About the AI</h4><p>A document explaining what this AI is and what it\'s supposed to do.</p></div>', unsafe_allow_html=True)
         about_file = st.file_uploader("Upload About the AI document", type=["docx", "pdf", "txt"], key="about_upl", label_visibility="collapsed")
         if about_file is not None and about_file.file_id != st.session_state.get("_about_file_id"):
             st.session_state.about_text = load_about_doc(about_file)
@@ -1409,7 +1622,7 @@ if active_tab == TAB_LABELS[2]:
             st.session_state["_about_file_id"] = about_file.file_id
 
     with col3:
-        st.markdown('<div class="setup-card"><h4>3. Test Cases</h4><p>Choose how to build your test question set.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="setup-card"><h4>Test Cases</h4><p>Choose how to build your test question set.</p></div>', unsafe_allow_html=True)
         uploaded = st.file_uploader("Upload test_questions.xlsx", type=["xlsx", "xls"], key="questions_upl", label_visibility="collapsed")
         if uploaded is not None and uploaded.file_id != st.session_state.get("_questions_file_id"):
             raw = pd.read_excel(uploaded)
@@ -1438,15 +1651,16 @@ if active_tab == TAB_LABELS[2]:
         st.markdown("#### Generate Test Questions with AI")
         st.markdown("###### Step A — Add your AI API key")
         st.caption(
-            "This powers the AI that writes your test cases. Paste an Anthropic, DeepSeek, or "
-            "Groq API key — kept only for this session, or set ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / "
-            "GROQ_API_KEY in .streamlit/secrets.toml. New to this? Groq (console.groq.com/keys) has a free tier."
+            "This powers the AI that writes your test cases. Paste an Anthropic, DeepSeek, Groq, or "
+            "OpenRouter API key — kept only for this session, or set ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / "
+            "GROQ_API_KEY / OPENROUTER_API_KEY in .streamlit/secrets.toml. New to this? Groq "
+            "(console.groq.com/keys) or OpenRouter (openrouter.ai/keys) both have a free tier."
         )
         st.text_input(
             "AI API key",
             type="password",
             key="ai_api_key_input",
-            placeholder="sk-ant-... / gsk_... / sk-...",
+            placeholder="sk-ant-... / gsk_... / sk-or-... / sk-...",
             label_visibility="collapsed",
         )
 
@@ -1584,7 +1798,7 @@ if active_tab == TAB_LABELS[2]:
         else:
             st.info("No document uploaded yet.")
 
-if active_tab == TAB_LABELS[3]:
+if active_tab == "Test & Score":
     if st.session_state.df is None:
         st.info("Upload `test_questions.xlsx` in the Setup tab first.")
     else:
@@ -1726,7 +1940,7 @@ if active_tab == TAB_LABELS[3]:
         )
         st.session_state.df = ensure_columns(edited)
 
-if active_tab == TAB_LABELS[4]:
+    st.markdown("---")
     if st.session_state.df is None:
         st.info("Upload `test_questions.xlsx` in the Setup tab first.")
     else:
@@ -1755,14 +1969,14 @@ if active_tab == TAB_LABELS[4]:
 
         if scoring_method.startswith("AI judge"):
             st.caption(
-                "Paste an Anthropic, DeepSeek, or Groq API key so AI can compare each Expected Answer against "
-                "the actual answer by meaning, not just wording."
+                "Paste an Anthropic, DeepSeek, Groq, or OpenRouter API key so AI can compare each Expected "
+                "Answer against the actual answer by meaning, not just wording."
             )
             st.text_input(
                 "AI API key",
                 type="password",
                 key="ai_api_key_input",
-                placeholder="sk-ant-... / gsk_... / sk-...",
+                placeholder="sk-ant-... / gsk_... / sk-or-... / sk-...",
                 label_visibility="collapsed",
             )
             if ai_configured():
@@ -1884,7 +2098,7 @@ if active_tab == TAB_LABELS[4]:
         else:
             st.info("Click 'Run automatic scoring' to grade the answers you've collected so far.")
 
-if active_tab == TAB_LABELS[5]:
+if active_tab == "Results":
     st.subheader("Detect Bias")
     st.markdown(
         "Bias means the AI performs noticeably worse for certain topics, question types, or phrasings than others. "
@@ -1892,7 +2106,7 @@ if active_tab == TAB_LABELS[5]:
         "much lower than the rest is a bias signal worth investigating."
     )
     if "scored_df" not in st.session_state:
-        st.info("Run scoring in tab 3 (Evaluate the Answers) first.")
+        st.info("Run scoring in the Test & Score tab first.")
     else:
         scored = st.session_state.scored_df
         valid = scored[scored["Reviewer Score"] >= 0]
@@ -1916,7 +2130,7 @@ if active_tab == TAB_LABELS[5]:
             )
 
             st.markdown("### By category")
-            st.bar_chart(by_cat, color="#7C3AED")
+            st.bar_chart(by_cat, color="#4FA8D8")
 
             st.markdown(f"**Overall average score:** {overall_avg:.2f} / 3")
             if flagged_categories:
@@ -1932,17 +2146,17 @@ if active_tab == TAB_LABELS[5]:
                 st.success("No category is significantly below the overall average.")
 
             st.markdown("### By source (Dataset vs About the AI vs General)")
-            st.bar_chart(by_source, color="#7C3AED")
+            st.bar_chart(by_source, color="#4FA8D8")
             st.caption(
                 "A low 'About the AI' score means the agent isn't doing what it's described to do. "
                 "A low Dataset score means its answers don't match what it was trained on."
             )
 
-if active_tab == TAB_LABELS[7]:
+    st.markdown("---")
     st.subheader("Conclusion & Analysis")
     st.markdown("This is the deliverable — everything else was in service of this.")
     if "scored_df" not in st.session_state:
-        st.info("Run scoring in tab 3 (Evaluate the Answers) first.")
+        st.info("Run scoring in the Test & Score tab first.")
     else:
         scored = st.session_state.scored_df.copy()
         scored["Result"] = scored["Reviewer Score"].apply(result_from_score)
@@ -2007,7 +2221,7 @@ if active_tab == TAB_LABELS[7]:
         with save_col:
             if st.button("💾 Save Run to History"):
                 if st.session_state.get("current_project_id") is None:
-                    st.error("Add or select a project in the 1. Setup tab first.")
+                    st.error("Add or select a project in the Setup tab first.")
                 else:
                     run_id = save_run(
                         st.session_state["current_project_id"],
@@ -2030,7 +2244,7 @@ if active_tab == TAB_LABELS[7]:
         project_name_display = st.session_state.get("current_project_name", "")
         st.caption(
             f"Testing project: **{project_name_display}**" if project_name_display
-            else "Tip: add or select a project in the **1. Setup** tab to label this report and its saved history."
+            else "Tip: add or select a project in the **Setup** tab to label this report and its saved history."
         )
 
         st.markdown("##### What is this AI agent supposed to do?")
@@ -2152,14 +2366,14 @@ if active_tab == TAB_LABELS[7]:
             type="primary",
         )
         if not project_name:
-            st.caption("Tip: add or select a project in the **1. Setup** tab to name this file after the project you're testing.")
+            st.caption("Tip: add or select a project in the **Setup** tab to name this file after the project you're testing.")
 
-if active_tab == TAB_LABELS[6]:
+    st.markdown("---")
     st.subheader("Dashboard")
     st.markdown("Slice and drill into your current results, and track pass rate across saved runs over time.")
 
     if "scored_df" not in st.session_state:
-        st.info("Run scoring in tab 3 (Evaluate the Answers) first.")
+        st.info("Run scoring in the Test & Score tab first.")
     else:
         scored = st.session_state.scored_df.copy()
         scored["Result"] = scored["Reviewer Score"].apply(result_from_score)
@@ -2210,32 +2424,87 @@ if active_tab == TAB_LABELS[6]:
             dd1, dd2 = st.columns(2)
             with dd1:
                 st.markdown("**By Aspect**")
-                st.bar_chart(filtered["Aspect"].value_counts(), color="#7C3AED")
+                st.bar_chart(filtered["Aspect"].value_counts(), color="#4FA8D8")
             with dd2:
                 st.markdown("**By Category**")
-                st.bar_chart(filtered["Category"].value_counts(), color="#7C3AED")
+                st.bar_chart(filtered["Category"].value_counts(), color="#4FA8D8")
 
     st.markdown("---")
     st.markdown("### Run history")
-    all_projects_df = fetch_projects()
+    all_projects_df = fetch_projects(CURRENT_USER["id"], CURRENT_USER["role"])
     project_filter_options = ["All projects"] + [
         f"{r['name']} ({r['short_name']})" if r["short_name"] else r["name"]
         for _, r in all_projects_df.iterrows()
     ]
     project_filter_choice = st.selectbox("Filter by project", project_filter_options, key="history_project_filter")
     if project_filter_choice == "All projects":
-        runs_df = fetch_runs()
+        runs_df = fetch_runs(owner_user_id=None if IS_ADMIN else CURRENT_USER["id"])
     else:
         picked_row = all_projects_df.iloc[project_filter_options.index(project_filter_choice) - 1]
         runs_df = fetch_runs(project_id=int(picked_row["id"]))
 
     if runs_df.empty:
-        st.info("No runs saved yet. Use 'Save Run to History' in the Conclusion tab to start tracking trends here.")
+        st.info("No runs saved yet. Use 'Save Run to History' in the Results tab to start tracking trends here.")
     else:
         st.dataframe(runs_df, use_container_width=True)
         if len(runs_df) > 1:
             trend = runs_df.sort_values("Saved At")[["Saved At", "Pass Rate %"]].set_index("Saved At")
             st.markdown("**Pass rate over time**")
-            st.line_chart(trend, color="#7C3AED")
+            st.line_chart(trend, color="#4FA8D8")
         else:
             st.caption("Save at least 2 runs to see a trend line here.")
+
+if IS_ADMIN and active_tab == "Users":
+    st.subheader("Users")
+    st.caption("Add teammates as testers, or promote them to admin. Testers only see their own projects; admins see everyone's.")
+
+    with st.form("add_user_form", clear_on_submit=True):
+        st.markdown("##### + Add user")
+        u_col1, u_col2, u_col3 = st.columns([2, 2, 1])
+        with u_col1:
+            new_username = st.text_input("Username")
+        with u_col2:
+            new_password = st.text_input("Temporary password", type="password")
+        with u_col3:
+            new_role = st.selectbox("Role", ["tester", "admin"])
+        add_user_submitted = st.form_submit_button("Add User", type="primary")
+    if add_user_submitted:
+        if not new_username.strip() or not new_password:
+            st.error("Enter both a username and a password.")
+        elif get_user_by_username(new_username.strip()):
+            st.error(f"Username '{new_username.strip()}' is already taken.")
+        else:
+            create_user(new_username.strip(), new_password, new_role)
+            st.success(f"User '{new_username.strip()}' added as {new_role}.")
+            st.rerun()
+
+    st.markdown("##### All users")
+    users_df = fetch_users()
+    st.dataframe(users_df, use_container_width=True, hide_index=True)
+
+    st.markdown("##### Edit a user")
+    st.caption("Rename a user or reset their password — including your own account (e.g. renaming 'admin').")
+    edit_username = st.selectbox("Choose a user", users_df["username"], key="edit_user_select")
+    edit_row = users_df[users_df["username"] == edit_username].iloc[0]
+    with st.form("edit_user_form"):
+        e_col1, e_col2 = st.columns(2)
+        with e_col1:
+            edited_username = st.text_input("Username", value=edit_row["username"])
+        with e_col2:
+            edited_password = st.text_input("New password (leave blank to keep current)", type="password")
+        save_edit = st.form_submit_button("Save changes", type="primary")
+    if save_edit:
+        edited_username = edited_username.strip()
+        if not edited_username:
+            st.error("Username can't be empty.")
+        elif edited_username != edit_row["username"] and get_user_by_username(edited_username):
+            st.error(f"Username '{edited_username}' is already taken.")
+        else:
+            if edited_username != edit_row["username"]:
+                rename_user(int(edit_row["id"]), edited_username)
+                if int(edit_row["id"]) == CURRENT_USER["id"]:
+                    st.session_state["user"]["username"] = edited_username
+            if edited_password:
+                change_user_password(int(edit_row["id"]), edited_password)
+            st.success(f"Updated '{edit_row['username']}'.")
+            st.rerun()
