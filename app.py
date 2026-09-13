@@ -1,14 +1,17 @@
 import io
+import os
 import re
 import json
 import time
 import difflib
-import sqlite3
 import hashlib
 import secrets
 import textwrap
+import warnings
 from pathlib import Path
 from datetime import date, datetime
+
+import psycopg2
 
 import matplotlib
 matplotlib.use("Agg")
@@ -58,44 +61,61 @@ LIFECYCLE_PHASE_OPTIONS = [
 ]
 PASS_THRESHOLD = 2  # Reviewer Score >= this counts as a Pass
 
-DB_PATH = Path(__file__).parent / "ai_tester_history.db"
+# Silence pandas' "only sqlalchemy connectable is supported" notice — a plain
+# psycopg2 connection works fine here via its DBAPI2 fallback, just not the
+# officially-blessed path.
+warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy connectable")
+
+
+def get_database_url() -> str:
+    try:
+        url = st.secrets.get("DATABASE_URL")
+    except Exception:
+        url = None
+    return url or os.environ.get("DATABASE_URL")
 
 
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = psycopg2.connect(get_database_url())
+    conn.autocommit = True  # simplest transaction model for this app's usage pattern
+    return conn
+
+
+def run(conn, sql, params=None):
+    """sqlite3's Connection.execute() shortcut doesn't exist on psycopg2
+    connections — only cursors have .execute(). This restores that shortcut
+    so call sites can stay close to how they read before the Postgres move."""
+    cur = conn.cursor()
+    cur.execute(sql, params or ())
+    return cur
 
 
 def init_db():
     conn = get_conn()
-    conn.execute(
-        """
+    run(conn, """
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'tester',
             created_at TEXT NOT NULL
         )
-        """
-    )
-    conn.execute(
-        """
+        """)
+    run(conn, """
         CREATE TABLE IF NOT EXISTS projects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             short_name TEXT,
             created_at TEXT NOT NULL
         )
-        """
-    )
-    existing_project_cols = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
-    if "user_id" not in existing_project_cols:
-        conn.execute("ALTER TABLE projects ADD COLUMN user_id INTEGER")
-    conn.execute(
-        """
+        """)
+    # Postgres' "ADD COLUMN IF NOT EXISTS" replaces the PRAGMA-based existence
+    # checks the old SQLite version needed — no separate lookup required.
+    run(conn, "ALTER TABLE projects ADD COLUMN IF NOT EXISTS user_id INTEGER")
+    run(conn, """
         CREATE TABLE IF NOT EXISTS runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             created_at TEXT NOT NULL,
             project_name TEXT,
             agent_desc TEXT,
@@ -109,17 +129,12 @@ def init_db():
             pass_rate REAL,
             overall_avg REAL
         )
-        """
-    )
-    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
-    if "project_name" not in existing_cols:
-        conn.execute("ALTER TABLE runs ADD COLUMN project_name TEXT")
-    if "project_id" not in existing_cols:
-        conn.execute("ALTER TABLE runs ADD COLUMN project_id INTEGER")
-    conn.execute(
-        """
+        """)
+    run(conn, "ALTER TABLE runs ADD COLUMN IF NOT EXISTS project_name TEXT")
+    run(conn, "ALTER TABLE runs ADD COLUMN IF NOT EXISTS project_id INTEGER")
+    run(conn, """
         CREATE TABLE IF NOT EXISTS run_questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             run_id INTEGER NOT NULL,
             question_id TEXT,
             category TEXT,
@@ -134,9 +149,7 @@ def init_db():
             result TEXT,
             FOREIGN KEY (run_id) REFERENCES runs (id)
         )
-        """
-    )
-    conn.commit()
+        """)
     conn.close()
 
 
@@ -154,21 +167,21 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
 def create_user(username: str, password: str, role: str = "tester") -> int:
     pw_hash, salt = hash_password(password)
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO users (username, password_hash, salt, role, created_at) VALUES (?, ?, ?, ?, ?)",
+    cur = run(
+        conn,
+        "INSERT INTO users (username, password_hash, salt, role, created_at) "
+        "VALUES (%s, %s, %s, %s, %s) RETURNING id",
         (username, pw_hash, salt, role, datetime.now().isoformat(timespec="seconds")),
     )
-    user_id = cur.lastrowid
-    conn.commit()
+    user_id = cur.fetchone()[0]
     conn.close()
     return user_id
 
 
 def get_user_by_username(username: str):
     conn = get_conn()
-    row = conn.execute(
-        "SELECT id, username, password_hash, salt, role FROM users WHERE username = ?", (username,)
+    row = run(
+        conn, "SELECT id, username, password_hash, salt, role FROM users WHERE username = %s", (username,)
     ).fetchone()
     conn.close()
     return row
@@ -185,24 +198,20 @@ def fetch_users() -> pd.DataFrame:
 
 def rename_user(user_id: int, new_username: str):
     conn = get_conn()
-    conn.execute("UPDATE users SET username = ? WHERE id = ?", (new_username, user_id))
-    conn.commit()
+    run(conn, "UPDATE users SET username = %s WHERE id = %s", (new_username, user_id))
     conn.close()
 
 
 def change_user_password(user_id: int, new_password: str):
     pw_hash, salt = hash_password(new_password)
     conn = get_conn()
-    conn.execute(
-        "UPDATE users SET password_hash = ?, salt = ? WHERE id = ?", (pw_hash, salt, user_id)
-    )
-    conn.commit()
+    run(conn, "UPDATE users SET password_hash = %s, salt = %s WHERE id = %s", (pw_hash, salt, user_id))
     conn.close()
 
 
 def ensure_default_admin():
     conn = get_conn()
-    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    count = run(conn, "SELECT COUNT(*) FROM users").fetchone()[0]
     conn.close()
     if count == 0:
         create_user("admin", "admin123", role="admin")
@@ -210,26 +219,23 @@ def ensure_default_admin():
 
 def create_project(name: str, short_name: str, user_id: int) -> int:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO projects (name, short_name, created_at, user_id) VALUES (?, ?, ?, ?)",
+    cur = run(
+        conn,
+        "INSERT INTO projects (name, short_name, created_at, user_id) VALUES (%s, %s, %s, %s) RETURNING id",
         (name, short_name, datetime.now().isoformat(timespec="seconds"), user_id),
     )
-    project_id = cur.lastrowid
-    conn.commit()
+    project_id = cur.fetchone()[0]
     conn.close()
     return project_id
 
 
 def delete_project(project_id: int):
     conn = get_conn()
-    run_ids = [row[0] for row in conn.execute("SELECT id FROM runs WHERE project_id = ?", (project_id,))]
+    run_ids = [row[0] for row in run(conn, "SELECT id FROM runs WHERE project_id = %s", (project_id,))]
     if run_ids:
-        placeholders = ",".join("?" * len(run_ids))
-        conn.execute(f"DELETE FROM run_questions WHERE run_id IN ({placeholders})", run_ids)
-        conn.execute("DELETE FROM runs WHERE project_id = ?", (project_id,))
-    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-    conn.commit()
+        run(conn, "DELETE FROM run_questions WHERE run_id IN %s", (tuple(run_ids),))
+        run(conn, "DELETE FROM runs WHERE project_id = %s", (project_id,))
+    run(conn, "DELETE FROM projects WHERE id = %s", (project_id,))
     conn.close()
 
 
@@ -238,7 +244,7 @@ def fetch_projects(user_id=None, role=None) -> pd.DataFrame:
     query = "SELECT id, name, short_name, created_at, user_id FROM projects"
     params = ()
     if role != "admin" and user_id is not None:
-        query += " WHERE user_id = ?"
+        query += " WHERE user_id = %s"
         params = (user_id,)
     query += " ORDER BY created_at DESC"
     df = pd.read_sql_query(query, conn, params=params)
@@ -248,10 +254,10 @@ def fetch_projects(user_id=None, role=None) -> pd.DataFrame:
 
 def save_run(project_id, project_name, agent_desc, dataset_name, about_name, total, answered, passed, failed, not_answered, pass_rate, overall_avg, scored_df) -> int:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
+    cur = run(
+        conn,
         "INSERT INTO runs (created_at, project_id, project_name, agent_desc, dataset_name, about_name, total, answered, passed, failed, not_answered, pass_rate, overall_avg) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (
             datetime.now().isoformat(timespec="seconds"),
             project_id,
@@ -268,11 +274,12 @@ def save_run(project_id, project_name, agent_desc, dataset_name, about_name, tot
             overall_avg,
         ),
     )
-    run_id = cur.lastrowid
+    run_id = cur.fetchone()[0]
     for _, r in scored_df.iterrows():
-        cur.execute(
+        run(
+            conn,
             "INSERT INTO run_questions (run_id, question_id, category, aspect, source, question, expected_answer, ai_answer, similarity, auto_score, reviewer_score, result) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 run_id,
                 str(r["ID"]),
@@ -288,25 +295,35 @@ def save_run(project_id, project_name, agent_desc, dataset_name, about_name, tot
                 r["Result"],
             ),
         )
-    conn.commit()
     conn.close()
     return run_id
 
 
 def fetch_runs(project_id=None, owner_user_id=None) -> pd.DataFrame:
     conn = get_conn()
+    # Double-quoted identifiers here, not single-quoted — Postgres treats a
+    # single-quoted 'Run #' as a string literal, not a column alias, unlike
+    # SQLite's more lenient quoting rules.
+    #
+    # The literal "%" in the "Pass Rate %" alias must be written "%%" —
+    # psycopg2 scans the whole query for %s-style placeholders before
+    # sending it, so any lone "%" (even inside a quoted alias) throws off
+    # its placeholder count and raises "tuple index out of range". "%%"
+    # collapses back to a single literal "%" in the query Postgres sees, so
+    # the resulting column name is still exactly "Pass Rate %".
     query = (
-        "SELECT id AS 'Run #', COALESCE(project_name, '(unnamed)') AS 'Project', created_at AS 'Saved At', "
-        "total AS 'Questions', answered AS 'Answered', "
-        "passed AS 'Passed', failed AS 'Failed', pass_rate AS 'Pass Rate %', overall_avg AS 'Avg Score' "
+        'SELECT id AS "Run #", COALESCE(project_name, \'(unnamed)\') AS "Project", '
+        'created_at AS "Saved At", total AS "Questions", answered AS "Answered", '
+        'passed AS "Passed", failed AS "Failed", pass_rate AS "Pass Rate %%", '
+        'overall_avg AS "Avg Score" '
         "FROM runs"
     )
     conditions, params = [], []
     if project_id is not None:
-        conditions.append("project_id = ?")
+        conditions.append("project_id = %s")
         params.append(project_id)
     if owner_user_id is not None:
-        conditions.append("project_id IN (SELECT id FROM projects WHERE user_id = ?)")
+        conditions.append("project_id IN (SELECT id FROM projects WHERE user_id = %s)")
         params.append(owner_user_id)
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
