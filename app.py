@@ -1468,10 +1468,15 @@ def login_screen():
     )
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
-        with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Log in", type="primary", use_container_width=True)
+        username = st.text_input("Username", key="login_username")
+        show_password = st.session_state.get("login_show_password", False)
+        password = st.text_input(
+            "Password",
+            type="default" if show_password else "password",
+            key="login_password",
+        )
+        st.checkbox("Show password", key="login_show_password")
+        submitted = st.button("Log in", type="primary", use_container_width=True)
         if submitted:
             row = get_user_by_username(username.strip())
             if row and verify_password(password, row[3], row[2]):
@@ -1479,7 +1484,6 @@ def login_screen():
                 st.rerun()
             else:
                 st.error("Incorrect username or password.")
-        st.caption("First time here? Default admin login is **admin / admin123** — change it after logging in.")
 
 
 if "user" not in st.session_state:
@@ -2475,13 +2479,16 @@ if IS_ADMIN and active_tab == "Users":
     st.subheader("Users")
     st.caption("Add teammates as testers, or promote them to admin. Testers only see their own projects; admins see everyone's.")
 
+    show_new_password = st.checkbox("Show password", key="add_user_show_password")
     with st.form("add_user_form", clear_on_submit=True):
         st.markdown("##### + Add user")
         u_col1, u_col2, u_col3 = st.columns([2, 2, 1])
         with u_col1:
             new_username = st.text_input("Username")
         with u_col2:
-            new_password = st.text_input("Temporary password", type="password")
+            new_password = st.text_input(
+                "Temporary password", type="default" if show_new_password else "password"
+            )
         with u_col3:
             new_role = st.selectbox("Role", ["tester", "admin"])
         add_user_submitted = st.form_submit_button("Add User", type="primary")
@@ -2503,12 +2510,16 @@ if IS_ADMIN and active_tab == "Users":
     st.caption("Rename a user or reset their password — including your own account (e.g. renaming 'admin').")
     edit_username = st.selectbox("Choose a user", users_df["username"], key="edit_user_select")
     edit_row = users_df[users_df["username"] == edit_username].iloc[0]
+    show_edit_password = st.checkbox("Show password", key="edit_user_show_password")
     with st.form("edit_user_form"):
         e_col1, e_col2 = st.columns(2)
         with e_col1:
             edited_username = st.text_input("Username", value=edit_row["username"])
         with e_col2:
-            edited_password = st.text_input("New password (leave blank to keep current)", type="password")
+            edited_password = st.text_input(
+                "New password (leave blank to keep current)",
+                type="default" if show_edit_password else "password",
+            )
         save_edit = st.form_submit_button("Save changes", type="primary")
     if save_edit:
         edited_username = edited_username.strip()
