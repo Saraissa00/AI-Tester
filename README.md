@@ -56,3 +56,4 @@ Streamlit prints a local URL (usually `http://localhost:8501`) — open it to st
 - **Streamlit** — app framework and UI
 - **PostgreSQL (Supabase)** — persists projects, test cases, and run history
 - **REST APIs** — used to reach the AI agent under test
+
